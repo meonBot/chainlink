@@ -1,5 +1,5 @@
 import { ethers } from 'ethers'
-import { networkName, MAINNET_ID } from 'utils/'
+import { networkName, MAINNET_ID } from '../utils/'
 
 export function createContract(address, provider, abi) {
   return new ethers.Contract(address, abi, provider)

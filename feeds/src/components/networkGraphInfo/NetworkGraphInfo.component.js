@@ -3,8 +3,8 @@ import { Icon } from 'antd'
 import CountDown from './CountDown.component'
 import Percent from './Percent.component'
 import Legend from './Legend.component'
-import TooltipQuestion from 'components/shared/TooltipQuestion'
-import { humanizeUnixTimestamp, networkName, MAINNET_ID } from 'utils/'
+import TooltipQuestion from '../shared/TooltipQuestion'
+import { humanizeUnixTimestamp, networkName, MAINNET_ID } from '../../utils'
 
 function NetworkGraphInfo({
   currentAnswer,

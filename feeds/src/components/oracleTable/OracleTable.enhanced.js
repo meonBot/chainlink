@@ -1,10 +1,9 @@
-import OracleTable from './OracleTable.component'
 import { connect } from 'react-redux'
-
+import OracleTable from './OracleTable.component'
 import {
   aggregationSelectors,
   aggregationOperations,
-} from 'state/ducks/aggregation'
+} from '../../state/ducks/aggregation'
 
 const mapStateToProps = state => ({
   networkGraphNodes: aggregationSelectors.networkGraphNodes(state),

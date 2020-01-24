@@ -8,8 +8,6 @@ interface SignInRequestParams {
   password: string
 }
 
-const SIGN_OUT_ENDPOINT = '/api/v1/admin/logout'
-
 export class Auth {
   constructor(private api: Api) {}
 

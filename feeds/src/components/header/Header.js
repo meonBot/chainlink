@@ -2,8 +2,8 @@ import React from 'react'
 import { Link } from 'react-router-dom'
 import { Button } from 'antd'
 import { withRouter } from 'react-router'
-import ChainlinkLogo from 'components/shared/ChainlinkLogo'
 import ReactGA from 'react-ga'
+// import ChainlinkLogo from '../components/shared/ChainlinkLogo'
 
 const Header = ({ location }) => {
   return (
@@ -11,7 +11,7 @@ const Header = ({ location }) => {
       <div className="header__main-nav">
         <Link to="/">
           <div className="header__logotype">
-            <ChainlinkLogo />
+            {/* <ChainlinkLogo /> */}
             <h1>Chainlink</h1>
           </div>
         </Link>

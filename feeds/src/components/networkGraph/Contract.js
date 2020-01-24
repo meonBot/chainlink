@@ -1,6 +1,6 @@
 import React from 'react'
 import { connect } from 'react-redux'
-import { networkGraphOperations } from 'state/ducks/networkGraph'
+import { networkGraphOperations } from '../../state/ducks/networkGraph'
 
 const Contract = ({
   currentAnswer,
