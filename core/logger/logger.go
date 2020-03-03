@@ -63,16 +63,18 @@ func SetLogger(zl *zap.Logger) {
 	logger = &Logger{zl.Sugar()}
 }
 
+const readWritePermission = os.FileMode(0600)
+
 // CreateProductionLogger returns a log config for the passed directory
 // with the given LogLevel and customizes stdout for pretty printing.
 func CreateProductionLogger(
 	dir string, jsonConsole bool, lvl zapcore.Level, toDisk bool) *zap.Logger {
 	config := zap.NewProductionConfig()
+	destination := logFileURI(dir)
 	if !jsonConsole {
 		config.OutputPaths = []string{"pretty://console"}
 	}
 	if toDisk {
-		destination := logFileURI(dir)
 		config.OutputPaths = append(config.OutputPaths, destination)
 		config.ErrorOutputPaths = append(config.ErrorOutputPaths, destination)
 	}
@@ -82,6 +84,11 @@ func CreateProductionLogger(
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	if err := os.Chmod(destination, readWritePermission); err != nil {
+		log.Fatal(err)
+	}
+
 	return zl
 }
 

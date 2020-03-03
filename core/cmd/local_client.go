@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"chainlink/core/logger"
@@ -37,6 +38,9 @@ func (cli *Client) RunNode(c *clipkg.Context) error {
 		logIfNonceOutOfSync(store)
 	})
 	store := app.GetStore()
+	if err := checkFilePermissions(cli.Config.RootDir()); err != nil {
+		return cli.errorOut(err)
+	}
 	pwd, err := passwordFromFile(c.String("password"))
 	if err != nil {
 		return cli.errorOut(fmt.Errorf("error reading password: %+v", err))
@@ -71,6 +75,28 @@ func (cli *Client) RunNode(c *clipkg.Context) error {
 
 func loggedStop(app chainlink.Application) {
 	logger.WarnIf(app.Stop())
+}
+
+const (
+	invalidPermissions = os.FileMode(0077)
+)
+
+func checkFilePermissions(directory string) error {
+	err := filepath.Walk(directory,
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			m := info.Mode()
+			if m&invalidPermissions != 0 {
+				return fmt.Errorf("%s has overly permissive file permissions, %s", path, m.String())
+			}
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func passwordFromFile(pwdFile string) (string, error) {
