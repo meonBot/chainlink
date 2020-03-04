@@ -6,7 +6,10 @@
     "allowJs": true,
     "module": "esnext",
     "resolveJsonModule": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false
   },
   "include": ["src", "@types", "test"],
   "references": [

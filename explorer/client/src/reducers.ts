@@ -1,5 +1,6 @@
 import { combineReducers } from 'redux'
 import adminAuth from './reducers/adminAuth'
+import adminHeads from './reducers/adminHeads'
 import adminOperators from './reducers/adminOperators'
 import adminOperatorsIndex from './reducers/adminOperatorsIndex'
 import adminOperatorsShow from './reducers/adminOperatorsShow'
@@ -14,6 +15,7 @@ import taskRuns from './reducers/taskRuns'
 const reducer = combineReducers({
   adminAuth,
   adminOperators,
+  adminHeads,
   adminOperatorsIndex,
   adminOperatorsShow,
   chainlinkNodes,

@@ -1,3 +1,5 @@
+import { Head } from 'explorer/models'
+
 /**
  * NOTIFY_ERROR
  */
@@ -78,6 +80,20 @@ export type FetchAdminOperatorSucceededAction = {
 }
 
 /**
+ * FETCH_ADMIN_HEAD_SUCCEEDED
+ */
+export interface AdminHeadNormalizedMeta {
+  head: {
+    data: any[]
+  }
+}
+
+export interface AdminHeadNormalizedData {
+  heads: any
+  meta: AdminHeadNormalizedMeta
+}
+
+/**
  * FETCH_JOB_RUNS_SUCCEEDED
  */
 
@@ -126,6 +142,11 @@ export interface UpdateQueryAction {
   data?: string
 }
 
+export interface FetchAdminHeadsSucceeded {
+  type: 'FETCH_ADMIN_HEADS_SUCCEEDED'
+  data: Head[]
+}
+
 export type Actions =
   | NotifyErrorAction
   | FetchAdminSigninSucceededAction
@@ -135,4 +156,5 @@ export type Actions =
   | FetchAdminOperatorSucceededAction
   | FetchJobRunsSucceededAction
   | FetchJobRunSucceededAction
+  | FetchAdminHeadsSucceeded
   | UpdateQueryAction

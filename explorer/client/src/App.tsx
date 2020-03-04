@@ -13,6 +13,7 @@ import AdminSignIn from './containers/Admin/SignIn'
 import AdminSignOut from './containers/Admin/SignOut'
 import AdminOperatorIndex from './containers/Admin/Operator/Index'
 import AdminOperatorShow from './containers/Admin/Operator/Show'
+import AdminHeadIndex from './containers/Admin/Head/Index'
 
 const App = () => {
   return (
@@ -37,6 +38,7 @@ const App = () => {
         <AdminLayout path="/admin">
           <AdminOperatorIndex path="/operators" />
           <AdminOperatorShow path="/operators/:operatorId" />
+          <AdminHeadIndex path="/heads" />
           <Redirect path="/" from="/" to="/admin/operators" noThrow />
           <NotFound default />
         </AdminLayout>
