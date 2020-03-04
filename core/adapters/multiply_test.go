@@ -2,12 +2,12 @@ package adapters_test
 
 import (
 	"encoding/json"
-	"math/big"
 	"testing"
 
 	"chainlink/core/adapters"
 	"chainlink/core/internal/cltest"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,18 +20,18 @@ func TestMultiply_Marshal(t *testing.T) {
 	}{
 		{
 			"w/ value",
-			adapters.Multiply{Times: big.NewFloat(3.142)},
+			adapters.Multiply{Times: cltest.MustParseDecimalFromString(t, "3.142")},
 			`{"times":"3.142"}`,
 		},
 		{
 			"w/ value",
-			adapters.Multiply{Times: big.NewFloat(5)},
+			adapters.Multiply{Times: decimal.NewFromInt(5)},
 			`{"times":"5"}`,
 		},
 		{
 			"w/o value",
 			adapters.Multiply{},
-			`{}`,
+			`{"times":"0"}`,
 		},
 	}
 
@@ -53,12 +53,12 @@ func TestMultiply_Unmarshal(t *testing.T) {
 		{
 			"w/ value",
 			`{"Times": 5}`,
-			adapters.Multiply{Times: big.NewFloat(5)},
+			adapters.Multiply{Times: decimal.NewFromInt(5)},
 		},
 		{
 			"w/o value",
 			`{}`,
-			adapters.Multiply{Times: nil},
+			adapters.Multiply{Times: decimal.NewFromInt(1)},
 		},
 	}
 
@@ -75,15 +75,15 @@ func TestMultiply_Unmarshal(t *testing.T) {
 func TestMultiply_Perform(t *testing.T) {
 	tests := []struct {
 		name  string
-		Times *big.Float
+		Times decimal.Decimal
 		json  string
 		want  string
 	}{
-		{"by 100", big.NewFloat(100), `{"result":"1.23"}`, "123"},
-		{"float", big.NewFloat(100), `{"result":1.23}`, "123"},
-		{"negative", big.NewFloat(-5), `{"result":"1.23"}`, "-6.15"},
-		{"no times parameter", nil, `{"result":"3.14"}`, "3.14"},
-		{"zero", big.NewFloat(0), `{"result":"1.23"}`, "0"},
+		{"by 100", decimal.NewFromInt(100), `{"result":"1.23"}`, "123"},
+		{"float", decimal.NewFromInt(100), `{"result":1.23}`, "123"},
+		{"negative", decimal.NewFromInt(-5), `{"result":"1.23"}`, "-6.15"},
+		{"no times parameter", decimal.NewFromInt(1), `{"result":"3.14"}`, "3.14"},
+		{"zero", decimal.NewFromInt(0), `{"result":"1.23"}`, "0"},
 	}
 
 	for _, tt := range tests {
@@ -102,11 +102,11 @@ func TestMultiply_Perform(t *testing.T) {
 func TestMultiply_Perform_Failure(t *testing.T) {
 	tests := []struct {
 		name  string
-		Times *big.Float
+		Times decimal.Decimal
 		json  string
 		want  string
 	}{
-		{"object", big.NewFloat(100), `{"result":{"foo":"bar"}}`, ""},
+		{"object", decimal.NewFromInt(100), `{"result":{"foo":"bar"}}`, ""},
 	}
 
 	for _, tt := range tests {
