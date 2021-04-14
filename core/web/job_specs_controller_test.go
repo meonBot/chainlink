@@ -3,13 +3,16 @@ package web_test
 import (
 	"bytes"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/mock"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/pkg/errors"
 
+	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
 
 	"github.com/manyminds/api2go/jsonapi"
@@ -261,7 +264,7 @@ func TestJobSpecsController_Create_CustomName(t *testing.T) {
 func TestJobSpecsController_CreateExternalInitiator_Success(t *testing.T) {
 	t.Parallel()
 
-	var eiReceived web.JobSpecNotice
+	var eiReceived services.JobSpecNotice
 	eiMockServer, assertCalled := cltest.NewHTTPMockServer(t, http.StatusOK, "POST", "",
 		func(header http.Header, body string) {
 			err := json.Unmarshal([]byte(body), &eiReceived)
@@ -274,6 +277,7 @@ func TestJobSpecsController_CreateExternalInitiator_Success(t *testing.T) {
 	defer assertMocksCalled()
 	app, cleanup := cltest.NewApplication(t,
 		eth.NewClientWith(rpcClient, gethClient),
+		services.NewExternalInitiatorManager(),
 	)
 	defer cleanup()
 	app.Start()
@@ -290,7 +294,7 @@ func TestJobSpecsController_CreateExternalInitiator_Success(t *testing.T) {
 	require.NoError(t, err)
 
 	jobSpec := cltest.FixtureCreateJobViaWeb(t, app, "./testdata/external_initiator_job.json")
-	expected := web.JobSpecNotice{
+	expected := services.JobSpecNotice{
 		JobID:  jobSpec.ID,
 		Type:   models.InitiatorExternal,
 		Params: cltest.JSONFromString(t, `{"foo":"bar"}`),
@@ -359,6 +363,7 @@ func TestJobSpecsController_Create_FluxMonitor_disabled(t *testing.T) {
 	config := cltest.NewTestConfig(t)
 	config.Set("CHAINLINK_DEV", "FALSE")
 	config.Set("FEATURE_FLUX_MONITOR", "FALSE")
+	config.Set("GAS_UPDATER_ENABLED", false)
 
 	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
 	defer assertMocksCalled()
@@ -385,6 +390,7 @@ func TestJobSpecsController_Create_FluxMonitor_enabled(t *testing.T) {
 	config := cltest.NewTestConfig(t)
 	config.Set("CHAINLINK_DEV", "FALSE")
 	config.Set("FEATURE_FLUX_MONITOR", "TRUE")
+	config.Set("GAS_UPDATER_ENABLED", false)
 
 	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
 	defer assertMocksCalled()
@@ -392,7 +398,20 @@ func TestJobSpecsController_Create_FluxMonitor_enabled(t *testing.T) {
 		eth.NewClientWith(rpcClient, gethClient),
 	)
 	defer cleanup()
-	rpcClient.On("Call", mock.Anything, "eth_call", mock.Anything, "latest").Return(nil)
+
+	getOraclesResult, err := cltest.GenericEncode([]string{"address[]"}, []common.Address{})
+	require.NoError(t, err)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "getOracles").
+		Return(getOraclesResult, nil)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "latestRoundData").
+		Return(nil, errors.New("first round"))
+	result := cltest.MakeRoundStateReturnData(2, true, 10000, 7, 0, 1000, 100, 1)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "oracleRoundState").
+		Return(result, nil).Maybe()
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "minSubmissionValue").
+		Return(cltest.MustGenericEncode([]string{"uint256"}, big.NewInt(0)), nil)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "maxSubmissionValue").
+		Return(cltest.MustGenericEncode([]string{"uint256"}, big.NewInt(10000000)), nil)
 
 	require.NoError(t, app.Start())
 
@@ -409,6 +428,7 @@ func TestJobSpecsController_Create_FluxMonitor_Bridge(t *testing.T) {
 	config := cltest.NewTestConfig(t)
 	config.Set("CHAINLINK_DEV", "FALSE")
 	config.Set("FEATURE_FLUX_MONITOR", "TRUE")
+	config.Set("GAS_UPDATER_ENABLED", false)
 
 	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
 	defer assertMocksCalled()
@@ -416,7 +436,20 @@ func TestJobSpecsController_Create_FluxMonitor_Bridge(t *testing.T) {
 		eth.NewClientWith(rpcClient, gethClient),
 	)
 	defer cleanup()
-	rpcClient.On("Call", mock.Anything, "eth_call", mock.Anything, "latest").Return(nil)
+
+	getOraclesResult, err := cltest.GenericEncode([]string{"address[]"}, []common.Address{})
+	require.NoError(t, err)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "getOracles").
+		Return(getOraclesResult, nil)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "latestRoundData").
+		Return(nil, errors.New("first round"))
+	result := cltest.MakeRoundStateReturnData(2, true, 10000, 7, 0, 1000, 100, 1)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "oracleRoundState").
+		Return(result, nil).Maybe()
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "minSubmissionValue").
+		Return(cltest.MustGenericEncode([]string{"uint256"}, big.NewInt(0)), nil)
+	cltest.MockFluxAggCall(gethClient, cltest.FluxAggAddress, "maxSubmissionValue").
+		Return(cltest.MustGenericEncode([]string{"uint256"}, big.NewInt(10000000)), nil)
 
 	require.NoError(t, app.Start())
 
@@ -439,6 +472,7 @@ func TestJobSpecsController_Create_FluxMonitor_NoBridgeError(t *testing.T) {
 	config := cltest.NewTestConfig(t)
 	config.Set("CHAINLINK_DEV", "FALSE")
 	config.Set("FEATURE_FLUX_MONITOR", "TRUE")
+	config.Set("GAS_UPDATER_ENABLED", false)
 
 	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
 	defer assertMocksCalled()

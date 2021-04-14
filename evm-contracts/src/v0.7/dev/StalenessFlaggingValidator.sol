@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.7.0;
+pragma solidity ^0.7.0;
 
 import "./ConfirmedOwner.sol";
 import "../vendor/SafeMathChainlink.sol";
 import "../interfaces/FlagsInterface.sol";
 import "../interfaces/AggregatorV3Interface.sol";
+import "../interfaces/UpkeepInterface.sol";
 
-contract StalenessFlaggingValidator is ConfirmedOwner {
+contract StalenessFlaggingValidator is ConfirmedOwner, UpkeepInterface {
   using SafeMathChainlink for uint256;
 
   FlagsInterface private s_flags;
@@ -28,8 +29,9 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @dev Ensure that this contract has sufficient write permissions
    * on the flag contract
    */
-  constructor(address flagsAddress) 
-    public 
+  constructor(
+    address flagsAddress
+  )
     ConfirmedOwner(msg.sender)
   {
     setFlagsAddress(flagsAddress);
@@ -39,7 +41,9 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @notice Updates the flagging contract address for raising flags
    * @param flagsAddress sets the address of the flags contract
    */
-  function setFlagsAddress(address flagsAddress)
+  function setFlagsAddress(
+    address flagsAddress
+  )
     public
     onlyOwner()
   {
@@ -56,7 +60,10 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @param aggregators address[] memory
    * @param flaggingThresholds uint256[] memory
    */
-  function setThresholds(address[] memory aggregators, uint256[] memory flaggingThresholds)
+  function setThresholds(
+    address[] memory aggregators,
+    uint256[] memory flaggingThresholds
+  )
     public 
     onlyOwner()
   {
@@ -79,9 +86,16 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @param aggregators address[] memory
    * @return address[] memory stale aggregators
    */
-  function check(address[] memory aggregators) public view returns (address[] memory) {
+  function check(
+    address[] memory aggregators
+  )
+    public
+    view
+    returns (
+      address[] memory
+    )
+  {
     uint256 currentTimestamp = block.timestamp;
-
     address[] memory staleAggregators = new address[](aggregators.length);
     uint256 staleCount = 0;
     for (uint256 i = 0; i < aggregators.length; i++) {
@@ -104,13 +118,58 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @notice Check for staleness in an array of aggregators, raise a flag
    * on the flags contract for each aggregator that is stale
    * @dev This contract must have write permissions on the flags contract
-   * @param aggregators address[] calldata
+   * @param aggregators address[] memory
    * @return address[] memory stale aggregators
    */
-  function update(address[] calldata aggregators) external returns (address[] memory){
+  function update(
+    address[] memory aggregators
+  )
+    public
+    returns (
+      address[] memory
+    )
+  {
     address[] memory staleAggregators = check(aggregators);
     s_flags.raiseFlags(staleAggregators);
     return staleAggregators;
+  }
+
+  /**
+   * @notice Check for staleness in an array of aggregators
+   * @dev Overriding KeeperInterface
+   * @param data bytes encoded address array
+   * @return needsUpkeep bool indicating whether upkeep needs to be performed
+   * @return staleAggregators bytes encoded address array of stale aggregator addresses
+   */
+  function checkUpkeep(
+    bytes calldata data
+  )
+    external
+    view
+    override
+    returns (
+      bool,
+      bytes memory
+    )
+  {
+    address[] memory staleAggregators = check(abi.decode(data, (address[])));
+    bool needsUpkeep = (staleAggregators.length > 0);
+    return (needsUpkeep, abi.encode(staleAggregators));
+  }
+
+  /**
+   * @notice Check for staleness in an array of aggregators, raise a flag
+   * on the flags contract for each aggregator that is stale
+   * @dev Overriding KeeperInterface
+   * @param data bytes encoded address array
+   */
+  function performUpkeep(
+    bytes calldata data
+  )
+    external
+    override
+  {
+    update(abi.decode(data, (address[])));
   }
 
   /**
@@ -118,7 +177,13 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @param aggregator address
    * @return uint256
    */
-  function threshold(address aggregator) external view returns (uint256) {
+  function threshold(
+    address aggregator
+  )
+    external
+    view
+    returns (uint256)
+  {
     return s_thresholdSeconds[aggregator];
   }
 
@@ -126,7 +191,13 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @notice Get the flags address
    * @return address
    */
-  function flags() external view returns (address) {
+  function flags()
+    external
+    view
+    returns (
+      address
+    )
+  {
     return address(s_flags);
   }
 
@@ -138,10 +209,15 @@ contract StalenessFlaggingValidator is ConfirmedOwner {
    * @param currentTimestamp uint256
    * @return stale bool
    */
-  function isStale(address aggregator, uint256 currentTimestamp) 
+  function isStale(
+    address aggregator,
+    uint256 currentTimestamp
+  ) 
     private
     view
-    returns (bool stale)
+    returns (
+      bool stale
+    )
   {
     if (s_thresholdSeconds[aggregator] == 0) {
       return false;

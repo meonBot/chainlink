@@ -10,6 +10,12 @@ import (
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 )
 
+func mustDecimal(t *testing.T, arg string) *decimal.Decimal {
+	ret, err := decimal.NewFromString(arg)
+	require.NoError(t, err)
+	return &ret
+}
+
 func TestMultiplyTask_Happy(t *testing.T) {
 	t.Parallel()
 
@@ -102,7 +108,7 @@ func TestMultiplyTask_Happy(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			task := pipeline.MultiplyTask{Times: test.times}
-			result := task.Run(context.Background(), pipeline.TaskRun{}, []pipeline.Result{{Value: test.input}})
+			result := task.Run(context.Background(), pipeline.JSONSerializable{}, []pipeline.Result{{Value: test.input}})
 			require.NoError(t, result.Error)
 			require.Equal(t, test.want.String(), result.Value.(decimal.Decimal).String())
 		})
@@ -110,6 +116,8 @@ func TestMultiplyTask_Happy(t *testing.T) {
 }
 
 func TestMultiplyTask_Unhappy(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name  string
 		times decimal.Decimal
@@ -123,7 +131,7 @@ func TestMultiplyTask_Unhappy(t *testing.T) {
 		test := tt
 		t.Run(test.name, func(t *testing.T) {
 			task := pipeline.MultiplyTask{Times: test.times}
-			result := task.Run(context.Background(), pipeline.TaskRun{}, []pipeline.Result{{Value: test.input}})
+			result := task.Run(context.Background(), pipeline.JSONSerializable{}, []pipeline.Result{{Value: test.input}})
 			require.Error(t, result.Error)
 		})
 	}

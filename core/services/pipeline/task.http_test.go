@@ -23,6 +23,8 @@ import (
 // https://github.com/smartcontractkit/price-adapters
 
 func TestHTTPTask_Happy(t *testing.T) {
+	t.Parallel()
+
 	config, cleanup := cltest.NewConfig(t)
 	defer cleanup()
 
@@ -45,11 +47,7 @@ func TestHTTPTask_Happy(t *testing.T) {
 	}
 	task.HelperSetConfig(config)
 
-	result := task.Run(context.Background(), pipeline.TaskRun{
-		PipelineRun: pipeline.Run{
-			Meta: pipeline.JSONSerializable{emptyMeta},
-		},
-	}, nil)
+	result := task.Run(context.Background(), pipeline.JSONSerializable{emptyMeta, false}, nil)
 	require.NoError(t, result.Error)
 	require.NotNil(t, result.Value)
 	var x struct {
@@ -57,11 +55,13 @@ func TestHTTPTask_Happy(t *testing.T) {
 			Result decimal.Decimal `json:"result"`
 		} `json:"data"`
 	}
-	json.Unmarshal(result.Value.([]byte), &x)
+	json.Unmarshal([]byte(result.Value.(string)), &x)
 	require.Equal(t, decimal.NewFromInt(9700), x.Data.Result)
 }
 
 func TestHTTPTask_ErrorMessage(t *testing.T) {
+	t.Parallel()
+
 	config, cleanup := cltest.NewConfig(t)
 	defer cleanup()
 
@@ -86,13 +86,15 @@ func TestHTTPTask_ErrorMessage(t *testing.T) {
 	}
 	task.HelperSetConfig(config)
 
-	result := task.Run(context.Background(), pipeline.TaskRun{}, nil)
+	result := task.Run(context.Background(), pipeline.JSONSerializable{}, nil)
 	require.Error(t, result.Error)
 	require.Contains(t, result.Error.Error(), "could not hit data fetcher")
 	require.Nil(t, result.Value)
 }
 
 func TestHTTPTask_OnlyErrorMessage(t *testing.T) {
+	t.Parallel()
+
 	config, cleanup := cltest.NewConfig(t)
 	defer cleanup()
 
@@ -115,7 +117,7 @@ func TestHTTPTask_OnlyErrorMessage(t *testing.T) {
 	}
 	task.HelperSetConfig(config)
 
-	result := task.Run(context.Background(), pipeline.TaskRun{}, nil)
+	result := task.Run(context.Background(), pipeline.JSONSerializable{}, nil)
 	require.Error(t, result.Error)
 	require.Contains(t, result.Error.Error(), "RequestId")
 	require.Nil(t, result.Value)

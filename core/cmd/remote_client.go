@@ -21,15 +21,15 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/core/assets"
+	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/models/ocrkey"
-	"github.com/smartcontractkit/chainlink/core/store/models/p2pkey"
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/smartcontractkit/chainlink/core/web"
+	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 )
 
-var errUnauthorized = errors.New("401 Unauthorized")
+var errUnauthorized = errors.New(http.StatusText(http.StatusUnauthorized))
 
 // CreateServiceAgreement creates a ServiceAgreement based on JSON input
 func (cli *Client) CreateServiceAgreement(c *clipkg.Context) (err error) {
@@ -68,12 +68,12 @@ func (cli *Client) CreateExternalInitiator(c *clipkg.Context) (err error) {
 
 	// process optional URL
 	if c.NArg() == 2 {
-		var reqUrl *url.URL
-		reqUrl, err = url.ParseRequestURI(c.Args().Get(1))
+		var reqURL *url.URL
+		reqURL, err = url.ParseRequestURI(c.Args().Get(1))
 		if err != nil {
 			return cli.errorOut(err)
 		}
-		request.URL = (*models.WebURL)(reqUrl)
+		request.URL = (*models.WebURL)(reqURL)
 	}
 
 	requestData, err := json.Marshal(request)
@@ -211,7 +211,12 @@ func (cli *Client) ArchiveJobSpec(c *clipkg.Context) error {
 	return nil
 }
 
-// CreateV2JobSpec creates a V2 job
+// ListJobsV2 lists all v2 jobs
+func (cli *Client) ListJobsV2(c *clipkg.Context) (err error) {
+	return cli.getPage("/v2/jobs", c.Int("page"), &[]Job{})
+}
+
+// CreateJobV2 creates a V2 job
 // Valid input is a TOML string or a path to TOML file
 func (cli *Client) CreateJobV2(c *clipkg.Context) (err error) {
 	if !c.Args().Present() {
@@ -246,24 +251,16 @@ func (cli *Client) CreateJobV2(c *clipkg.Context) (err error) {
 			err = multierr.Append(err, rerr)
 			return cli.errorOut(err)
 		}
-		fmt.Printf("Error (status %v): %v\n", resp.StatusCode, string(body))
+		fmt.Printf("Error : %v\n", string(body))
 		return cli.errorOut(err)
 	}
 
-	responseBodyBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	ocrJobSpec := models.JobSpecV2{}
-	if err := web.ParseJSONAPIResponse(responseBodyBytes, &ocrJobSpec); err != nil {
-		return cli.errorOut(err)
-	}
-
-	fmt.Printf("Job added (job ID: %v).\n", ocrJobSpec.ID)
-	return nil
+	var js Job
+	err = cli.renderAPIResponse(resp, &js, "Job created")
+	return err
 }
 
+// DeleteJobV2 deletes a V2 job
 func (cli *Client) DeleteJobV2(c *clipkg.Context) error {
 	if !c.Args().Present() {
 		return cli.errorOut(errors.New("Must pass the job id to be archived"))
@@ -276,6 +273,8 @@ func (cli *Client) DeleteJobV2(c *clipkg.Context) error {
 	if err != nil {
 		return cli.errorOut(err)
 	}
+
+	fmt.Printf("Job %v Deleted\n", c.Args().First())
 	return nil
 }
 
@@ -288,12 +287,15 @@ func (cli *Client) TriggerPipelineRun(c *clipkg.Context) error {
 	if err != nil {
 		return cli.errorOut(err)
 	}
-	_, err = cli.parseResponse(resp)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	fmt.Printf("Pipeline run successfully triggered for job ID %v.\n", c.Args().First())
-	return nil
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = multierr.Append(err, cerr)
+		}
+	}()
+
+	var run pipeline.Run
+	err = cli.renderAPIResponse(resp, &run, "Pipeline run successfully triggered")
+	return err
 }
 
 // CreateJobRun creates job run based on SpecID and optional JSON
@@ -486,7 +488,8 @@ func (cli *Client) SendEther(c *clipkg.Context) (err error) {
 		}
 	}()
 
-	err = cli.printResponseBody(resp)
+	var tx webpresenters.EthTxResource
+	err = cli.renderAPIResponse(resp, &tx)
 	return err
 }
 
@@ -527,7 +530,7 @@ func (cli *Client) ChangePassword(c *clipkg.Context) (err error) {
 // IndexTransactions returns the list of transactions in descending order,
 // taking an optional page parameter
 func (cli *Client) IndexTransactions(c *clipkg.Context) error {
-	return cli.getPage("/v2/transactions", c.Int("page"), &[]presenters.EthTx{})
+	return cli.getPage("/v2/transactions", c.Int("page"), &[]webpresenters.EthTxResource{})
 }
 
 // ShowTransaction returns the info for the given transaction hash
@@ -545,7 +548,7 @@ func (cli *Client) ShowTransaction(c *clipkg.Context) (err error) {
 			err = multierr.Append(err, cerr)
 		}
 	}()
-	var tx presenters.EthTx
+	var tx webpresenters.EthTxResource
 	err = cli.renderAPIResponse(resp, &tx)
 	return err
 }
@@ -553,7 +556,7 @@ func (cli *Client) ShowTransaction(c *clipkg.Context) (err error) {
 // IndexTxAttempts returns the list of transactions in descending order,
 // taking an optional page parameter
 func (cli *Client) IndexTxAttempts(c *clipkg.Context) error {
-	return cli.getPage("/v2/tx_attempts", c.Int("page"), &[]presenters.EthTx{})
+	return cli.getPage("/v2/tx_attempts", c.Int("page"), &[]webpresenters.EthTxResource{})
 }
 
 func (cli *Client) buildSessionRequest(flag string) (models.SessionRequest, error) {
@@ -582,7 +585,7 @@ func getTOMLString(s string) (string, error) {
 func (cli *Client) parseResponse(resp *http.Response) ([]byte, error) {
 	b, err := parseResponse(resp)
 	if err == errUnauthorized {
-		return nil, cli.errorOut(multierr.Append(err, fmt.Errorf("try logging in")))
+		return nil, cli.errorOut(multierr.Append(err, fmt.Errorf("you must first login through the CLI")))
 	}
 	if err != nil {
 		jae := models.JSONAPIErrors{}
@@ -602,12 +605,13 @@ func (cli *Client) printResponseBody(resp *http.Response) error {
 	return nil
 }
 
-func (cli *Client) renderAPIResponse(resp *http.Response, dst interface{}) error {
+func (cli *Client) renderAPIResponse(resp *http.Response, dst interface{}, headers ...string) error {
 	var links jsonapi.Links
 	if err := cli.deserializeAPIResponse(resp, dst, &links); err != nil {
 		return cli.errorOut(err)
 	}
-	return cli.errorOut(cli.Render(dst))
+
+	return cli.errorOut(cli.Render(dst, headers...))
 }
 
 // SetMinimumGasPrice specifies the minimum gas price to use for outgoing transactions
@@ -671,7 +675,8 @@ func (cli *Client) GetConfiguration(c *clipkg.Context) (err error) {
 	return err
 }
 
-// CancelJob cancels a running job
+// CancelJobRun cancels a running job,
+// Run ID must be passed
 func (cli *Client) CancelJobRun(c *clipkg.Context) error {
 	if !c.Args().Present() {
 		return cli.errorOut(errors.New("Must pass the run id to be cancelled"))
@@ -688,499 +693,69 @@ func (cli *Client) CancelJobRun(c *clipkg.Context) error {
 	return nil
 }
 
-// CreateETHKey creates a new ethereum key with the same password
-// as the one used to unlock the existing key.
-func (cli *Client) CreateETHKey(c *clipkg.Context) (err error) {
-	resp, err := cli.HTTP.Post("/v2/keys/eth", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	_, err = os.Stderr.WriteString("ETH key created.\n\n🔑 New key\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	var keys presenters.ETHKey
-	return cli.renderAPIResponse(resp, &keys)
-}
-
-// ListETHKeys renders a table containing the active account address
-// with its ETH & LINK balance
-func (cli *Client) ListETHKeys(c *clipkg.Context) (err error) {
-	resp, err := cli.HTTP.Get("/v2/keys/eth")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	_, err = os.Stderr.WriteString("🔑 ETH keys\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	var keys []presenters.ETHKey
-	return cli.renderAPIResponse(resp, &keys)
-}
-
-func (cli *Client) DeleteETHKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the address of the key to be deleted"))
-	}
-
-	if c.Bool("hard") && !confirmAction(c) {
-		return nil
-	}
-
-	var queryStr string
-	var confirmationMsg string
-	if c.Bool("hard") {
-		queryStr = "?hard=true"
-		confirmationMsg = "ETH key deleted.\n\n"
-	} else {
-		confirmationMsg = "ETH key archived.\n\n"
-	}
-
-	address := c.Args().Get(0)
-	resp, err := cli.HTTP.Delete(fmt.Sprintf("/v2/keys/eth/%s%s", address, queryStr))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode == 200 {
-		fmt.Print(confirmationMsg)
-	}
-	_, err = os.Stderr.WriteString("🔑 Deleted ETH key\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	var key presenters.ETHKey
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ImportETHKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the filepath of the key to be imported"))
-	}
-
-	oldPasswordFile := c.String("oldpassword")
-	if len(oldPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --oldpassword/-p flag"))
-	}
-	oldPassword, err := ioutil.ReadFile(oldPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.Args().Get(0)
-	keyJSON, err := ioutil.ReadFile(filepath)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	normalizedPassword := normalizePassword(string(oldPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/eth/import?oldpassword="+normalizedPassword, bytes.NewReader(keyJSON))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	_, err = os.Stderr.WriteString("🔑 Imported ETH key\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	var key presenters.ETHKey
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ExportETHKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the address of the key to export"))
-	}
-
-	newPasswordFile := c.String("newpassword")
-	if len(newPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --newpassword/-p flag"))
-	}
-	newPassword, err := ioutil.ReadFile(newPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.String("output")
-	if len(newPassword) == 0 {
-		return cli.errorOut(errors.New("Must specify --output/-o flag"))
-	}
-
-	address := c.Args().Get(0)
-
-	normalizedPassword := normalizePassword(string(newPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/eth/export/"+address+"?newpassword="+normalizedPassword, nil)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not make HTTP request"))
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	keyJSON, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read response body"))
-	}
-
-	err = utils.WriteFileWithMaxPerms(filepath, keyJSON, 0600)
-	if err != nil {
-		return cli.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
-	}
-
-	_, err = os.Stderr.WriteString("🔑 Exported ETH key " + address + " to " + filepath + "\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	return nil
-}
-
-func (cli *Client) CreateP2PKey(c *clipkg.Context) (err error) {
-	resp, err := cli.HTTP.Post("/v2/keys/p2p", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode == 200 {
-		fmt.Printf("Created P2P keypair.\n\n")
-	}
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ListP2PKeys(c *clipkg.Context) (err error) {
-	resp, err := cli.HTTP.Get("/v2/keys/p2p", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var keys []p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &keys)
-}
-
-func (cli *Client) DeleteP2PKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the key ID to be deleted"))
-	}
-	id, err := strconv.ParseUint(c.Args().Get(0), 10, 32)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	if !confirmAction(c) {
-		return nil
-	}
-
-	var queryStr string
-	if c.Bool("hard") {
-		queryStr = "?hard=true"
-	}
-
-	resp, err := cli.HTTP.Delete(fmt.Sprintf("/v2/keys/p2p/%d%s", id, queryStr))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode == 200 {
-		fmt.Printf("P2P key deleted.\n\n")
-	}
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ImportP2PKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the filepath of the key to be imported"))
-	}
-
-	oldPasswordFile := c.String("oldpassword")
-	if len(oldPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --oldpassword/-p flag"))
-	}
-	oldPassword, err := ioutil.ReadFile(oldPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.Args().Get(0)
-	keyJSON, err := ioutil.ReadFile(filepath)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	normalizedPassword := normalizePassword(string(oldPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/p2p/import?oldpassword="+normalizedPassword, bytes.NewReader(keyJSON))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	_, err = os.Stderr.WriteString("🔑 Imported P2P key\n")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ExportP2PKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the ID of the key to export"))
-	}
-
-	newPasswordFile := c.String("newpassword")
-	if len(newPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --newpassword/-p flag"))
-	}
-	newPassword, err := ioutil.ReadFile(newPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.String("output")
-	if len(filepath) == 0 {
-		return cli.errorOut(errors.New("Must specify --output/-o flag"))
-	}
-
-	ID := c.Args().Get(0)
-
-	normalizedPassword := normalizePassword(string(newPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/p2p/export/"+ID+"?newpassword="+normalizedPassword, nil)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not make HTTP request"))
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	keyJSON, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read response body"))
-	}
-
-	err = utils.WriteFileWithMaxPerms(filepath, keyJSON, 0600)
-	if err != nil {
-		return cli.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
-	}
-
-	_, err = os.Stderr.WriteString(fmt.Sprintf("🔑 Exported P2P key %s to %s", ID, filepath))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	return nil
-}
-
-// CreateOCRKeyBundle creates a key and inserts it into encrypted_ocr_key_bundles,
-// protected by the password in the password file
-func (cli *Client) CreateOCRKeyBundle(c *clipkg.Context) error {
-	resp, err := cli.HTTP.Post("/v2/keys/ocr", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode == 200 {
-		fmt.Printf("Created OCR key bundle.\n\n")
-	}
-	var key ocrkey.EncryptedKeyBundle
-	return cli.renderAPIResponse(resp, &key)
-}
-
-// ListOCRKeyBundles lists the available OCR Key Bundles
-func (cli *Client) ListOCRKeyBundles(c *clipkg.Context) error {
-	resp, err := cli.HTTP.Get("/v2/keys/ocr", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var keys []ocrkey.EncryptedKeyBundle
-	return cli.renderAPIResponse(resp, &keys)
-}
-
-// DeleteOCRKeyBundle creates a key and inserts it into encrypted_ocr_keys,
-// protected by the password in the password file
-func (cli *Client) DeleteOCRKeyBundle(c *clipkg.Context) error {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the key ID to be deleted"))
-	}
-	id, err := models.Sha256HashFromHex(c.Args().Get(0))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	if !confirmAction(c) {
-		return nil
-	}
-
-	var queryStr string
-	if c.Bool("hard") {
-		queryStr = "?hard=true"
-	}
-
-	resp, err := cli.HTTP.Delete(fmt.Sprintf("/v2/keys/ocr/%s%s", id, queryStr))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode == 200 {
-		fmt.Printf("OCR key bundle deleted.\n\n")
-	}
-	var key ocrkey.EncryptedKeyBundle
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ImportOCRKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the filepath of the key to be imported"))
-	}
-
-	oldPasswordFile := c.String("oldpassword")
-	if len(oldPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --oldpassword/-p flag"))
-	}
-	oldPassword, err := ioutil.ReadFile(oldPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.Args().Get(0)
-	keyJSON, err := ioutil.ReadFile(filepath)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	normalizedPassword := normalizePassword(string(oldPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/ocr/import?oldpassword="+normalizedPassword, bytes.NewReader(keyJSON))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	_, err = os.Stderr.WriteString("🔑 Imported OCR key bundle")
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	var key ocrkey.EncryptedKeyBundle
-	return cli.renderAPIResponse(resp, &key)
-}
-
-func (cli *Client) ExportOCRKey(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the ID of the key to export"))
-	}
-
-	newPasswordFile := c.String("newpassword")
-	if len(newPasswordFile) == 0 {
-		return cli.errorOut(errors.New("Must specify --newpassword/-p flag"))
-	}
-	newPassword, err := ioutil.ReadFile(newPasswordFile)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read password file"))
-	}
-
-	filepath := c.String("output")
-	if len(filepath) == 0 {
-		return cli.errorOut(errors.New("Must specify --output/-o flag"))
-	}
-
-	ID := c.Args().Get(0)
-
-	normalizedPassword := normalizePassword(string(newPassword))
-	resp, err := cli.HTTP.Post("/v2/keys/ocr/export/"+ID+"?newpassword="+normalizedPassword, nil)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not make HTTP request"))
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	keyJSON, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "Could not read response body"))
-	}
-
-	err = utils.WriteFileWithMaxPerms(filepath, keyJSON, 0600)
-	if err != nil {
-		return cli.errorOut(errors.Wrapf(err, "Could not write %v", filepath))
-	}
-
-	_, err = os.Stderr.WriteString(fmt.Sprintf("🔑 Exported OCR key bundle %s to %s", ID, filepath))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	return nil
-}
-
 func normalizePassword(password string) string {
 	return url.PathEscape(strings.TrimSpace(password))
+}
+
+// SetLogLevel sets the log level on the node
+func (cli *Client) SetLogLevel(c *clipkg.Context) (err error) {
+	logLevel := c.String("level")
+	request := web.LogPatchRequest{Level: logLevel}
+	requestData, err := json.Marshal(request)
+	if err != nil {
+		return cli.errorOut(err)
+	}
+
+	buf := bytes.NewBuffer(requestData)
+	resp, err := cli.HTTP.Patch("/v2/log", buf)
+	if err != nil {
+		return cli.errorOut(err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = multierr.Append(err, cerr)
+		}
+	}()
+
+	var lR webpresenters.LogResource
+	err = cli.renderAPIResponse(resp, &lR)
+	return err
+}
+
+// SetLogSQL enables or disables the log sql statemnts
+func (cli *Client) SetLogSQL(c *clipkg.Context) (err error) {
+
+	// Enforces selection of --enable or --disable
+	if !c.Bool("enable") && !c.Bool("disable") {
+		return cli.errorOut(errors.New("Must set logSql --enabled || --disable"))
+	}
+
+	// Sets logSql to true || false based on the --enabled flag
+	logSql := c.Bool("enable")
+
+	if err != nil {
+		return cli.errorOut(err)
+	}
+	request := web.LogPatchRequest{SqlEnabled: &logSql}
+	requestData, err := json.Marshal(request)
+	if err != nil {
+		return cli.errorOut(err)
+	}
+
+	buf := bytes.NewBuffer(requestData)
+	resp, err := cli.HTTP.Patch("/v2/log", buf)
+	if err != nil {
+		return cli.errorOut(err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = multierr.Append(err, cerr)
+		}
+	}()
+
+	var lR webpresenters.LogResource
+	err = cli.renderAPIResponse(resp, &lR)
+	return err
 }
 
 func getBufferFromJSON(s string) (*bytes.Buffer, error) {
@@ -1229,7 +804,7 @@ func parseResponse(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return b, errUnauthorized
 	} else if resp.StatusCode >= http.StatusBadRequest {
-		return b, errors.New(resp.Status)
+		return b, errors.New("Error")
 	}
 	return b, err
 }

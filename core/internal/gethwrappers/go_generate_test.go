@@ -14,12 +14,11 @@ import (
 	"strings"
 	"testing"
 
+	gethParams "github.com/ethereum/go-ethereum/params"
+	"github.com/fatih/color"
+
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/tidwall/gjson"
-
-	gethParams "github.com/ethereum/go-ethereum/params"
-
-	"github.com/fatih/color"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,8 +30,8 @@ import (
 func TestCheckContractHashesFromLastGoGenerate(t *testing.T) {
 	versions, err := ReadVersionsDB()
 	require.NoError(t, err)
-	require.NotEmpty(t, versions.GethVersion,
-		`version DB should have a "GETH_VERSION:" line`)
+	require.NotEmpty(t, versions.GethVersion, `version DB should have a "GETH_VERSION:" line`)
+
 	wd, err := os.Getwd()
 	if err != nil {
 		wd = "<directory containing this test>"
@@ -40,13 +39,15 @@ func TestCheckContractHashesFromLastGoGenerate(t *testing.T) {
 	require.Equal(t, versions.GethVersion, gethParams.Version,
 		color.HiRedString(boxOutput("please re-run `go generate %s` and commit the"+
 			"changes", wd)))
+
 	for _, contractVersionInfo := range versions.ContractVersions {
-		compareCurrentCompilerAritfactAgainstRecordsAndSoliditySources(
-			t, contractVersionInfo)
+		if isOCRContract(contractVersionInfo.CompilerArtifactPath) {
+			continue
+		}
+		compareCurrentCompilerArtifactAgainstRecordsAndSoliditySources(t, contractVersionInfo)
 	}
 	// Just check that LinkToken details haven't changed (they never ought to)
-	linkDetails, err := ioutil.ReadFile(filepath.Join(getProjectRoot(t),
-		"evm-test-helpers/src/LinkToken.json"))
+	linkDetails, err := ioutil.ReadFile(filepath.Join(getProjectRoot(t), "evm-test-helpers/src/LinkToken.json"))
 	require.NoError(t, err, "could not read link contract details")
 	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(linkDetails)),
 		"27c0e17a79553fccc63a4400c6bbe415ff710d9cc7c25757bff0f7580205c922",
@@ -79,16 +80,26 @@ func TestArtifactCompilerVersionMatchesConfig(t *testing.T) {
 		beltArtifact, err := ioutil.ReadFile(beltArtifactPath)
 		require.NoError(t, err)
 		metadata := gjson.Get(string(beltArtifact), "compilerOutput.metadata").String()
-		fullVersion := gjson.Get(metadata, "compiler.version").String()                    // eg 0.6.6+commit.6c089d02
-		patchVersionInArtifact := patchVersionRegex.FindString(fullVersion)                // eg 0.6.6
-		minorVersion := minorVersionRegex.FindString(artifact)                             // eg v0.6
-		escapedMinorVersion := strings.ReplaceAll(minorVersion, ".", `\.`)                 // eg v0\.6
-		patchVersionInConfig := gjson.Get(versionConfigJSON, escapedMinorVersion).String() // eg 0.6.6
+		fullVersion := gjson.Get(metadata, "compiler.version").String()                 // eg 0.6.6+commit.6c089d02
+		patchVersionInArtifact := patchVersionRegex.FindString(fullVersion)             // eg 0.6.6
+		if minorVersion := minorVersionRegex.FindString(artifact); minorVersion != "" { // eg v0.6
+			escapedMinorVersion := strings.ReplaceAll(minorVersion, ".", `\.`)                 // eg v0\.6
+			patchVersionInConfig := gjson.Get(versionConfigJSON, escapedMinorVersion).String() // eg 0.6.6
+			assert.Equal(t, patchVersionInArtifact, patchVersionInConfig)
 
-		assert.Equal(t, patchVersionInArtifact, patchVersionInConfig)
+		} else if isOCRContract(artifact) {
+			// OCR contracts' solc version is defined in libocr. This assertion must be kept in sync.
+			assert.Equal(t, patchVersionInArtifact, "0.7.6")
+		} else {
+			t.Fatalf("directory layout has changed: could not assert that the contract '%v' was compiled with the right version of solc", artifact)
+		}
 	}
 
 	require.NoError(t, scanner.Err())
+}
+
+func isOCRContract(fullpath string) bool {
+	return strings.Contains(fullpath, fmt.Sprintf("%[1]sOCR%[1]s", string(filepath.Separator)))
 }
 
 // rootDir is the local chainlink root working directory
@@ -106,7 +117,7 @@ func init() { // compute rootDir
 	}
 }
 
-// compareCurrentCompilerAritfactAgainstRecordsAndSoliditySources checks that
+// compareCurrentCompilerArtifactAgainstRecordsAndSoliditySources checks that
 // the file at each ContractVersion.CompilerArtifactPath hashes to its
 // ContractVersion.Hash, and that the solidity source code recorded in the
 // compiler artifact matches the current solidity contracts.
@@ -119,7 +130,7 @@ func init() { // compute rootDir
 // where <filePath> is the path to the contract, below the truffle contracts/
 // directory, and <code> is the source code of the contract at the time the JSON
 // file was generated.
-func compareCurrentCompilerAritfactAgainstRecordsAndSoliditySources(
+func compareCurrentCompilerArtifactAgainstRecordsAndSoliditySources(
 	t *testing.T, versionInfo ContractVersion,
 ) {
 	apath := versionInfo.CompilerArtifactPath

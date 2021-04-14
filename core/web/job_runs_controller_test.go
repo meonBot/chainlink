@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/smartcontractkit/chainlink/core/services/eth"
+	"github.com/smartcontractkit/chainlink/core/static"
 
+	uuid "github.com/satori/go.uuid"
 	"github.com/smartcontractkit/chainlink/core/auth"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -62,15 +64,19 @@ func TestJobRunsController_Index(t *testing.T) {
 	cltest.AssertServerResponse(t, resp, http.StatusOK)
 
 	var links jsonapi.Links
+	var meta jsonapi.Meta
 	var runs []models.JobRun
 
-	err := web.ParsePaginatedResponse(cltest.ParseResponseBody(t, resp), &runs, &links)
+	err := web.ParsePaginatedResponseWithMeta(cltest.ParseResponseBody(t, resp), &runs, &links, &meta)
 	assert.NoError(t, err)
 	assert.NotEmpty(t, links["next"].Href)
 	assert.Empty(t, links["prev"].Href)
 
 	require.Len(t, runs, 1)
 	assert.Equal(t, runA.ID, runs[0].ID, "expected runs order by createdAt ascending")
+	assert.EqualValues(t, meta["errored"], 1, "expect there to be 1 errored run")
+	assert.EqualValues(t, meta["completed"], 1, "expect there to be 1 completed run")
+	assert.EqualValues(t, meta["count"], 2, "expect there to be 2 runs in total")
 
 	resp, cleanup = client.Get(links["next"].Href)
 	defer cleanup()
@@ -115,18 +121,21 @@ func setupJobRunsControllerIndex(t assert.TestingT, app *cltest.TestApplication)
 	now := time.Now()
 
 	runA := cltest.NewJobRun(j1)
-	runA.ID = models.NewID()
+	runA.ID = uuid.NewV4()
 	runA.CreatedAt = now.Add(-2 * time.Second)
+	runA.Status = models.RunStatusErrored
 	assert.Nil(t, app.Store.CreateJobRun(&runA))
 
 	runB := cltest.NewJobRun(j1)
-	runB.ID = models.NewID()
+	runB.ID = uuid.NewV4()
 	runB.CreatedAt = now.Add(-time.Second)
+	runB.Status = models.RunStatusCompleted
 	assert.Nil(t, app.Store.CreateJobRun(&runB))
 
 	runC := cltest.NewJobRun(j2)
-	runC.ID = models.NewID()
+	runC.ID = uuid.NewV4()
 	runC.CreatedAt = now
+	runC.Status = models.RunStatusCompleted
 	assert.Nil(t, app.Store.CreateJobRun(&runC))
 
 	return &runA, &runB, &runC
@@ -186,8 +195,8 @@ func TestJobRunsController_Create_Wrong_ExternalInitiator(t *testing.T) {
 
 	// Set up AUTH
 	headers := make(map[string]string)
-	headers[web.ExternalInitiatorAccessKeyHeader] = wrongEIA.AccessKey
-	headers[web.ExternalInitiatorSecretHeader] = wrongEIA.Secret
+	headers[static.ExternalInitiatorAccessKeyHeader] = wrongEIA.AccessKey
+	headers[static.ExternalInitiatorSecretHeader] = wrongEIA.Secret
 
 	url := app.Config.ClientNodeURL() + "/v2/specs/" + j.ID.String() + "/runs"
 	bodyBuf := bytes.NewBufferString(`{"result":"100"}`)
@@ -245,7 +254,7 @@ func TestJobRunsController_Create_Archived(t *testing.T) {
 	client := app.NewHTTPClient()
 	resp, cleanup := client.Post("/v2/specs/"+j.ID.String()+"/runs", bytes.NewBufferString(`{"result":"100"}`))
 	defer cleanup()
-	cltest.AssertServerResponse(t, resp, http.StatusNotFound)
+	cltest.AssertServerResponse(t, resp, http.StatusGone)
 }
 
 func TestJobRunsController_Create_EmptyBody(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/smartcontractkit/chainlink/core/assets"
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -60,7 +61,7 @@ func (nc *NullClient) CallContext(ctx context.Context, result interface{}, metho
 
 func (nc *NullClient) HeaderByNumber(ctx context.Context, n *big.Int) (*models.Head, error) {
 	logger.Debug("NullClient#HeaderByNumber")
-	return nil, nil
+	return &models.Head{}, nil
 }
 
 type nullSubscription struct{}
@@ -146,4 +147,12 @@ func (nc *NullClient) CallContract(ctx context.Context, msg ethereum.CallMsg, bl
 func (nc *NullClient) CodeAt(ctx context.Context, account common.Address, blockNumber *big.Int) ([]byte, error) {
 	logger.Debug("NullClient#CodeAt")
 	return nil, nil
+}
+
+func (nc *NullClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
+	return nil
+}
+
+func (nc *NullClient) RoundRobinBatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
+	return nil
 }

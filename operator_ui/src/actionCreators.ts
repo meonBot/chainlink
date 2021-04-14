@@ -1,4 +1,4 @@
-import * as jsonapi from '@chainlink/json-api-client'
+import * as jsonapi from 'utils/json-api-client'
 import * as presenters from 'core/store/presenters'
 import normalize from 'json-api-normalizer'
 import { Action, Dispatch } from 'redux'
@@ -24,6 +24,7 @@ type Errors =
   | jsonapi.BadRequestError
   | jsonapi.ServerError
   | jsonapi.UnknownResponseError
+  | jsonapi.ConflictError
 
 type RestAction = 'UPSERT' | 'DELETE'
 
@@ -109,7 +110,6 @@ export const receiveSignoutSuccess = () => ({
 })
 
 function sendSignOut(dispatch: Dispatch) {
-  dispatch({ type: AuthActionType.REQUEST_SIGNOUT })
   return api.sessions
     .destroySession()
     .then(() => dispatch(receiveSignoutSuccess()))
@@ -143,8 +143,7 @@ export const deleteJobSpec = (
   return (dispatch: Dispatch) => {
     dispatch({ type: ResourceActionType.REQUEST_DELETE })
 
-    const endpoint =
-      jobType === 'Direct request' ? api.v2.specs : api.v2.ocrSpecs
+    const endpoint = jobType === 'Direct request' ? api.v2.specs : api.v2.jobs
 
     return endpoint
       .destroyJobSpec(id)
@@ -242,7 +241,7 @@ export const updateBridge = (
 // The calls above will be converted gradually.
 const handleError = (dispatch: Dispatch) => (error: Error) => {
   if (error instanceof jsonapi.AuthenticationError) {
-    sendSignOut(dispatch)
+    dispatch(receiveSignoutSuccess())
   } else {
     dispatch(notifyError(({ msg }: any) => msg, error))
   }

@@ -3,15 +3,17 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"sync"
 	"time"
 
-	"github.com/jinzhu/gorm"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
+	"gorm.io/gorm"
 
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/static"
 	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
@@ -48,15 +50,16 @@ type Event struct {
 	Payload string
 }
 
-func NewEventBroadcaster(uri string, minReconnectInterval time.Duration, maxReconnectDuration time.Duration) *eventBroadcaster {
+func NewEventBroadcaster(uri url.URL, minReconnectInterval time.Duration, maxReconnectDuration time.Duration) *eventBroadcaster {
 	if minReconnectInterval == time.Duration(0) {
 		minReconnectInterval = 1 * time.Second
 	}
 	if maxReconnectDuration == time.Duration(0) {
 		maxReconnectDuration = 1 * time.Minute
 	}
+	static.SetConsumerName(&uri, "EventBroadcaster")
 	return &eventBroadcaster{
-		uri:                  uri,
+		uri:                  uri.String(),
 		minReconnectInterval: minReconnectInterval,
 		maxReconnectDuration: maxReconnectDuration,
 		subscriptions:        make(map[string]map[Subscription]struct{}),
@@ -67,12 +70,13 @@ func NewEventBroadcaster(uri string, minReconnectInterval time.Duration, maxReco
 
 func (b *eventBroadcaster) Start() error {
 	return b.StartOnce("Postgres event broadcaster", func() (err error) {
+		// Explicitly using the lib/pq for notifications so we use the postgres driverName
+		// and NOT pgx.
 		db, err := sql.Open("postgres", b.uri)
 		if err != nil {
 			return err
 		}
 		b.db = db
-
 		b.listener = pq.NewListener(b.uri, b.minReconnectInterval, b.maxReconnectDuration, func(ev pq.ListenerEventType, err error) {
 			// These are always connection-related events, and the pq library
 			// automatically handles reconnecting to the DB. Therefore, we do not
@@ -245,7 +249,7 @@ func (sub *subscription) interestedIn(event Event) bool {
 
 func (sub *subscription) send(event Event) {
 	sub.queue.Add(event)
-	sub.processQueueWorker.WakeUp()
+	sub.processQueueWorker.WakeUpIfStarted()
 }
 
 const broadcastTimeout = 10 * time.Second
@@ -277,11 +281,11 @@ func (sub *subscription) channelName() string {
 }
 
 func (sub *subscription) Close() {
+	sub.eventBroadcaster.removeSubscription(sub)
 	// Close chDone before stopping the SleeperTask to avoid deadlocks
 	close(sub.chDone)
 	err := sub.processQueueWorker.Stop()
 	if err != nil {
 		logger.Errorw("THIS NEVER RETURNS AN ERROR", "error", err)
 	}
-	sub.eventBroadcaster.removeSubscription(sub)
 }

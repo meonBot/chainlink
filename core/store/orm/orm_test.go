@@ -1,14 +1,17 @@
 package orm_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/assets"
 	"github.com/smartcontractkit/chainlink/core/auth"
@@ -21,10 +24,11 @@ import (
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/jinzhu/gorm"
+	uuid "github.com/satori/go.uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/guregu/null.v4"
+	"gorm.io/gorm"
 )
 
 func TestORM_AllNotFound(t *testing.T) {
@@ -34,6 +38,36 @@ func TestORM_AllNotFound(t *testing.T) {
 
 	jobs := cltest.AllJobs(t, store)
 	assert.Equal(t, 0, len(jobs), "Queried array should be empty")
+}
+
+func TestORM_NodeVersion(t *testing.T) {
+	t.Parallel()
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	ver, err := store.FindLatestNodeVersion()
+
+	require.NoError(t, err)
+	require.NotNil(t, ver)
+	require.Contains(t, ver.Version, "random")
+
+	require.NoError(t, store.UpsertNodeVersion(models.NewNodeVersion("9.9.8")))
+
+	ver, err = store.FindLatestNodeVersion()
+
+	require.NoError(t, err)
+	require.NotNil(t, ver)
+	require.Equal(t, "9.9.8", ver.Version)
+
+	require.NoError(t, store.UpsertNodeVersion(models.NewNodeVersion("9.9.8")))
+	require.NoError(t, store.UpsertNodeVersion(models.NewNodeVersion("9.9.7")))
+	require.NoError(t, store.UpsertNodeVersion(models.NewNodeVersion("9.9.9")))
+
+	ver, err = store.FindLatestNodeVersion()
+
+	require.NoError(t, err)
+	require.NotNil(t, ver)
+	require.Equal(t, "9.9.9", ver.Version)
 }
 
 func TestORM_CreateJob(t *testing.T) {
@@ -61,11 +95,11 @@ func TestORM_Unscoped(t *testing.T) {
 
 	orm := store.ORM
 	job := cltest.NewJob()
-	err := orm.RawDB(func(db *gorm.DB) error {
+	err := orm.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		require.NoError(t, orm.CreateJob(&job))
 		require.NoError(t, db.Delete(&job).Error)
 		require.Error(t, db.First(&job).Error)
-		err := store.ORM.Unscoped().RawDB(func(db *gorm.DB) error {
+		err := store.ORM.Unscoped().RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 			require.NoError(t, db.First(&job).Error)
 			return nil
 		})
@@ -109,7 +143,10 @@ func TestORM_CreateExternalInitiator(t *testing.T) {
 	exi, err := models.NewExternalInitiator(token, &req)
 	require.NoError(t, err)
 	require.NoError(t, store.CreateExternalInitiator(exi))
-	require.Equal(t, store.CreateExternalInitiator(exi).Error(), `pq: duplicate key value violates unique constraint "external_initiators_name_key"`)
+
+	exi2, err := models.NewExternalInitiator(token, &req)
+	require.NoError(t, err)
+	require.Equal(t, `ERROR: duplicate key value violates unique constraint "external_initiators_name_key" (SQLSTATE 23505)`, store.CreateExternalInitiator(exi2).Error())
 }
 
 func TestORM_DeleteExternalInitiator(t *testing.T) {
@@ -152,9 +189,9 @@ func TestORM_ArchiveJob(t *testing.T) {
 	require.Error(t, utils.JustError(store.FindJobSpec(job.ID)))
 	require.Error(t, utils.JustError(store.FindJobRun(run.ID)))
 
-	orm := store.ORM.Unscoped()
-	require.NoError(t, utils.JustError(orm.FindJobSpec(job.ID)))
-	require.NoError(t, utils.JustError(orm.FindJobRun(run.ID)))
+	store.ORM.DB = store.DB.Unscoped().Session(&gorm.Session{})
+	require.NoError(t, utils.JustError(store.FindJobSpec(job.ID)))
+	require.NoError(t, utils.JustError(store.FindJobRun(run.ID)))
 }
 
 func TestORM_CreateJobRun_CreatesRunRequest(t *testing.T) {
@@ -175,7 +212,194 @@ func TestORM_CreateJobRun_CreatesRunRequest(t *testing.T) {
 	assert.Equal(t, 1, requestCount)
 }
 
-func TestORM_SaveJobRun_OnConstraintViolationOtherThanOptimisticLockFailureReturnsError(t *testing.T) {
+func TestORM_SaveJobRun_JobRun(t *testing.T) {
+	t.Parallel()
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	t.Run("does not error on a job run with no task runs", func(t *testing.T) {
+		job := cltest.NewJobWithWebInitiator()
+		require.NoError(t, store.CreateJob(&job))
+		rr := models.NewRunRequest(models.JSON{})
+		currentHeight := big.NewInt(0)
+		run, _ := services.NewRun(&job, &job.Initiators[0], currentHeight, rr, store.Config, store.ORM, time.Now())
+		require.NoError(t, store.CreateJobRun(run))
+		run.TaskRuns = []models.TaskRun{}
+
+		require.NoError(t, store.SaveJobRun(run))
+	})
+
+	job := cltest.NewJobWithWebInitiator()
+	require.NoError(t, store.CreateJob(&job))
+	rr := models.NewRunRequest(models.JSON{})
+	currentHeight := big.NewInt(0)
+	run, _ := services.NewRun(&job, &job.Initiators[0], currentHeight, rr, store.Config, store.ORM, time.Now())
+	require.NoError(t, store.CreateJobRun(run))
+
+	t.Run("if no results exist already, inserts them", func(t *testing.T) {
+		require.NoError(t, store.SaveJobRun(run))
+
+		require.True(t, run.ResultID.Valid)
+		require.Equal(t, run.ResultID.Int64, run.Result.ID)
+		require.Equal(t, models.JSON{}, run.Result.Data)
+		require.False(t, run.Result.ErrorMessage.Valid)
+
+		require.Len(t, run.TaskRuns, 1)
+
+		tr := run.TaskRuns[0]
+		require.True(t, tr.ResultID.Valid)
+		require.Equal(t, tr.ResultID.Int64, tr.Result.ID)
+		require.Equal(t, models.JSON{}, tr.Result.Data)
+		require.False(t, tr.Result.ErrorMessage.Valid)
+
+		loadedRun, err := store.FindJobRun(run.ID)
+		require.NoError(t, err)
+		require.Equal(t, *run, loadedRun)
+	})
+
+	t.Run("if results exist already, updates all run results for job run and task runs", func(t *testing.T) {
+		run.Result.Data = cltest.JSONFromString(t, `{"foo": 42}`)
+		run.Result.ErrorMessage = null.StringFrom(`something exploded`)
+
+		run.TaskRuns[0].Result.Data = cltest.JSONFromString(t, `{"bar": 3.14}`)
+		run.TaskRuns[0].Result.ErrorMessage = null.StringFrom(`something else exploded`)
+
+		require.NoError(t, store.SaveJobRun(run))
+
+		require.True(t, run.ResultID.Valid)
+		require.Equal(t, run.ResultID.Int64, run.Result.ID)
+		require.Equal(t, cltest.JSONFromString(t, `{"foo": 42}`), run.Result.Data)
+		require.Equal(t, "something exploded", run.Result.ErrorMessage.String)
+
+		require.Len(t, run.TaskRuns, 1)
+
+		tr := run.TaskRuns[0]
+		require.True(t, tr.ResultID.Valid)
+		require.Equal(t, tr.ResultID.Int64, tr.Result.ID)
+		require.Equal(t, cltest.JSONFromString(t, `{"bar": 3.14}`), tr.Result.Data)
+		require.Equal(t, "something else exploded", tr.Result.ErrorMessage.String)
+
+		loadedRun, err := store.FindJobRun(run.ID)
+		require.NoError(t, err)
+		require.Equal(t, *run, loadedRun)
+	})
+
+	t.Run("returns optimistic update failure if job run does not exist at all with that ID", func(t *testing.T) {
+		run2 := &models.JobRun{ID: uuid.NewV4(), Status: models.RunStatusUnstarted}
+		err := store.SaveJobRun(run2)
+
+		require.Error(t, err)
+		require.Equal(t, orm.ErrOptimisticUpdateConflict, errors.Cause(err))
+	})
+
+	t.Run("returns error if one of the task runs has not been inserted", func(t *testing.T) {
+		ts := models.TaskSpec{Type: adapters.TaskTypeNoOp, JobSpecID: job.ID}
+		require.NoError(t, store.DB.Create(&ts).Error)
+
+		tr := models.TaskRun{ID: uuid.NewV4(), Status: models.RunStatusErrored, TaskSpecID: ts.ID, JobRunID: run.ID}
+		run.TaskRuns = append(run.TaskRuns, tr)
+
+		err := store.SaveJobRun(run)
+		require.Error(t, err)
+		require.EqualError(t, err, fmt.Sprintf("SaveJobRun failed: failed to insert run_result; task run with id %s was missing", tr.ID))
+	})
+
+	t.Run("if one task run result exists and one does not, does a mixture of inserts and updates", func(t *testing.T) {
+		tr := run.TaskRuns[1]
+		require.NoError(t, store.DB.Save(&tr).Error)
+
+		run.TaskRuns[0].Result.Data = cltest.JSONFromString(t, `{"baz": 100}`)
+		run.TaskRuns[0].Result.ErrorMessage = null.String{}
+		run.TaskRuns[1].Result.ErrorMessage = null.StringFrom(`oh dear`)
+
+		require.NoError(t, store.SaveJobRun(run))
+
+		require.Len(t, run.TaskRuns, 2)
+
+		tr = run.TaskRuns[0]
+		assert.True(t, tr.ResultID.Valid)
+		assert.Equal(t, tr.ResultID.Int64, tr.Result.ID)
+		assert.Equal(t, cltest.JSONFromString(t, `{"baz": 100}`), tr.Result.Data)
+		assert.False(t, tr.Result.ErrorMessage.Valid)
+
+		tr = run.TaskRuns[1]
+		assert.True(t, tr.ResultID.Valid)
+		assert.Equal(t, tr.ResultID.Int64, tr.Result.ID)
+		assert.Equal(t, cltest.JSONFromString(t, ``), tr.Result.Data)
+		assert.Equal(t, "oh dear", tr.Result.ErrorMessage.String)
+
+		loadedRun, err := store.FindJobRun(run.ID)
+		require.NoError(t, err)
+		require.Equal(t, *run, loadedRun)
+	})
+
+	t.Run("updates fields on the job run", func(t *testing.T) {
+		finishedAt := null.TimeFrom(time.Unix(42, 0))
+		status := models.RunStatusPendingSleep
+		creationHeight := utils.NewBigI(43)
+		observedHeight := utils.NewBigI(44)
+		payment := assets.NewLink(45)
+
+		run.Status = status
+		run.FinishedAt = finishedAt
+		run.CreationHeight = creationHeight
+		run.ObservedHeight = observedHeight
+		run.Payment = payment
+
+		require.NoError(t, store.SaveJobRun(run))
+
+		require.Equal(t, finishedAt, run.FinishedAt)
+		require.Equal(t, status, run.Status)
+		require.Equal(t, creationHeight, run.CreationHeight)
+		require.Equal(t, observedHeight, run.ObservedHeight)
+		require.Equal(t, payment, run.Payment)
+
+		loadedRun, err := store.FindJobRun(run.ID)
+		require.NoError(t, err)
+		require.Equal(t, *run, loadedRun)
+	})
+
+	t.Run("updates fields on the task run", func(t *testing.T) {
+		status := models.RunStatusPendingConnection
+
+		run.TaskRuns[0].Status = status
+
+		require.NoError(t, store.SaveJobRun(run))
+
+		require.Equal(t, status, run.TaskRuns[0].Status)
+
+		loadedRun, err := store.FindJobRun(run.ID)
+		require.NoError(t, err)
+		require.Equal(t, *run, loadedRun)
+	})
+
+	t.Run("inserted sync_event", func(t *testing.T) {
+		se := models.SyncEvent{}
+		err := store.DB.Order("id desc").First(&se).Error
+		require.NoError(t, err)
+
+		assert.Contains(t, se.Body, job.ID.String())
+		assert.Contains(t, se.Body, run.ID.String())
+	})
+
+	t.Run("returns error if task run result is not preloaded", func(t *testing.T) {
+		run.TaskRuns[1].Result = models.RunResult{}
+		err := store.SaveJobRun(run)
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "expected TaskRun.Result to be preloaded")
+	})
+
+	t.Run("returns error if job run result is not preloaded", func(t *testing.T) {
+		run.Result = models.RunResult{}
+		err := store.SaveJobRun(run)
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "expected JobRun.Result to be preloaded")
+	})
+}
+
+func TestORM_SaveJobRun_OptimisticLockFailure(t *testing.T) {
 	t.Parallel()
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
@@ -184,10 +408,12 @@ func TestORM_SaveJobRun_OnConstraintViolationOtherThanOptimisticLockFailureRetur
 	require.NoError(t, store.CreateJob(&job))
 	jr := cltest.CreateJobRunWithStatus(t, store, job, models.RunStatusUnstarted)
 
-	jr.InitiatorID = 0
-	jr.Initiator = models.Initiator{}
+	// Something else updated it
+	require.NoError(t, store.DB.Exec(`UPDATE job_runs SET updated_at = '1942-01-01'`).Error)
+
 	err := store.SaveJobRun(&jr)
-	assert.EqualError(t, err, "pq: insert or update on table \"job_runs\" violates foreign key constraint \"fk_job_runs_initiator_id\"")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, orm.ErrOptimisticUpdateConflict))
 }
 
 func TestORM_SaveJobRun_ArchivedDoesNotRevertDeletedAt(t *testing.T) {
@@ -224,16 +450,15 @@ func TestORM_SaveJobRun_Cancelled(t *testing.T) {
 	jr.SetStatus(models.RunStatusInProgress)
 	require.NoError(t, store.SaveJobRun(&jr))
 
-	// Save the updated at before saving with cancelled
-	updatedAt := jr.UpdatedAt
-
 	jr.SetStatus(models.RunStatusCancelled)
 	require.NoError(t, store.SaveJobRun(&jr))
 
-	// Restore the previous updated at to simulate a conflict
-	jr.UpdatedAt = updatedAt
+	// Set a previous updated at to simulate a conflict
+	jr.UpdatedAt = time.Unix(42, 0)
 	jr.SetStatus(models.RunStatusInProgress)
-	assert.Equal(t, orm.ErrOptimisticUpdateConflict, store.SaveJobRun(&jr))
+	err := store.SaveJobRun(&jr)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, orm.ErrOptimisticUpdateConflict))
 }
 
 func TestORM_JobRunsFor(t *testing.T) {
@@ -256,18 +481,18 @@ func TestORM_JobRunsFor(t *testing.T) {
 
 	runs, err := store.JobRunsFor(job.ID)
 	assert.NoError(t, err)
-	actual := []*models.ID{runs[0].ID, runs[1].ID, runs[2].ID}
-	assert.Equal(t, []*models.ID{jr2.ID, jr1.ID, jr3.ID}, actual)
+	actual := []uuid.UUID{runs[0].ID, runs[1].ID, runs[2].ID}
+	assert.Equal(t, []uuid.UUID{jr2.ID, jr1.ID, jr3.ID}, actual)
 
 	limRuns, limErr := store.JobRunsFor(job.ID, 2)
 	assert.NoError(t, limErr)
-	limActual := []*models.ID{limRuns[0].ID, limRuns[1].ID}
-	assert.Equal(t, []*models.ID{jr2.ID, jr1.ID}, limActual)
+	limActual := []uuid.UUID{limRuns[0].ID, limRuns[1].ID}
+	assert.Equal(t, []uuid.UUID{jr2.ID, jr1.ID}, limActual)
 
 	_, limZeroErr := store.JobRunsFor(job.ID, 0)
 	assert.NoError(t, limZeroErr)
-	limZeroActual := []*models.ID{}
-	assert.Equal(t, []*models.ID{}, limZeroActual)
+	limZeroActual := []uuid.UUID{}
+	assert.Equal(t, []uuid.UUID{}, limZeroActual)
 }
 
 func TestORM_LinkEarnedFor(t *testing.T) {
@@ -329,20 +554,24 @@ func TestORM_JobRunsSortedFor(t *testing.T) {
 
 	jr1 := cltest.NewJobRun(includedJob)
 	jr1.CreatedAt = time.Now().AddDate(0, 0, -1)
+	jr1.Status = models.RunStatusCompleted
 	require.NoError(t, store.CreateJobRun(&jr1))
 	jr2 := cltest.NewJobRun(includedJob)
 	jr2.CreatedAt = time.Now().AddDate(0, 0, 1)
+	jr2.Status = models.RunStatusErrored
 	require.NoError(t, store.CreateJobRun(&jr2))
 
 	excludedJobRun := cltest.NewJobRun(excludedJob)
 	excludedJobRun.CreatedAt = time.Now().AddDate(0, 0, -9)
 	require.NoError(t, store.CreateJobRun(&excludedJobRun))
 
-	runs, count, err := store.JobRunsSortedFor(includedJob.ID, orm.Descending, 0, 100)
+	runs, count, completedCount, errorCount, err := store.JobRunsSortedFor(includedJob.ID, orm.Descending, 0, 100)
 	assert.NoError(t, err)
 	require.Equal(t, 2, count)
-	actual := []*models.ID{runs[0].ID, runs[1].ID} // doesn't include excludedJobRun
-	assert.Equal(t, []*models.ID{jr2.ID, jr1.ID}, actual)
+	require.Equal(t, 1, completedCount)
+	require.Equal(t, 1, errorCount)
+	actual := []uuid.UUID{runs[0].ID, runs[1].ID} // doesn't include excludedJobRun
+	assert.Equal(t, []uuid.UUID{jr2.ID, jr1.ID}, actual)
 }
 
 func TestORM_UnscopedJobRunsWithStatus_Happy(t *testing.T) {
@@ -361,7 +590,7 @@ func TestORM_UnscopedJobRunsWithStatus_Happy(t *testing.T) {
 		models.RunStatusPendingOutgoingConfirmations,
 		models.RunStatusCompleted}
 
-	var seedIds []*models.ID
+	var seedIds []uuid.UUID
 	for _, status := range statuses {
 		run := cltest.NewJobRun(j)
 		run.SetStatus(status)
@@ -372,17 +601,17 @@ func TestORM_UnscopedJobRunsWithStatus_Happy(t *testing.T) {
 	tests := []struct {
 		name     string
 		statuses []models.RunStatus
-		expected []*models.ID
+		expected []uuid.UUID
 	}{
 		{
 			"single status",
 			[]models.RunStatus{models.RunStatusPendingBridge},
-			[]*models.ID{seedIds[0]},
+			[]uuid.UUID{seedIds[0]},
 		},
 		{
 			"multiple status'",
 			[]models.RunStatus{models.RunStatusPendingBridge, models.RunStatusPendingIncomingConfirmations, models.RunStatusPendingOutgoingConfirmations},
-			[]*models.ID{seedIds[0], seedIds[1], seedIds[2]},
+			[]uuid.UUID{seedIds[0], seedIds[1], seedIds[2]},
 		},
 	}
 
@@ -391,7 +620,7 @@ func TestORM_UnscopedJobRunsWithStatus_Happy(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			pending := cltest.MustAllJobsWithStatus(t, store, test.statuses...)
 
-			pendingIDs := []*models.ID{}
+			pendingIDs := []uuid.UUID{}
 			for _, jr := range pending {
 				pendingIDs = append(pendingIDs, jr.ID)
 			}
@@ -417,7 +646,7 @@ func TestORM_UnscopedJobRunsWithStatus_Deleted(t *testing.T) {
 		models.RunStatusPendingConnection,
 		models.RunStatusCompleted}
 
-	var seedIds []*models.ID
+	var seedIds []uuid.UUID
 	for _, status := range statuses {
 		run := cltest.NewJobRun(j)
 		run.SetStatus(status)
@@ -430,12 +659,12 @@ func TestORM_UnscopedJobRunsWithStatus_Deleted(t *testing.T) {
 	tests := []struct {
 		name     string
 		statuses []models.RunStatus
-		expected []*models.ID
+		expected []uuid.UUID
 	}{
 		{
 			"single status",
 			[]models.RunStatus{models.RunStatusPendingBridge},
-			[]*models.ID{seedIds[0]},
+			[]uuid.UUID{seedIds[0]},
 		},
 		{
 			"multiple status'",
@@ -444,7 +673,7 @@ func TestORM_UnscopedJobRunsWithStatus_Deleted(t *testing.T) {
 				models.RunStatusPendingOutgoingConfirmations,
 				models.RunStatusPendingIncomingConfirmations,
 				models.RunStatusPendingConnection},
-			[]*models.ID{seedIds[0], seedIds[1], seedIds[2], seedIds[3]},
+			[]uuid.UUID{seedIds[0], seedIds[1], seedIds[2], seedIds[3]},
 		},
 	}
 
@@ -453,7 +682,7 @@ func TestORM_UnscopedJobRunsWithStatus_Deleted(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			pending := cltest.MustAllJobsWithStatus(t, store, test.statuses...)
 
-			pendingIDs := []*models.ID{}
+			pendingIDs := []uuid.UUID{}
 			for _, jr := range pending {
 				pendingIDs = append(pendingIDs, jr.ID)
 			}
@@ -738,7 +967,7 @@ func TestORM_AuthorizedUserWithSession(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				var bumpedSession models.Session
-				err = store.ORM.RawDB(func(db *gorm.DB) error {
+				err = store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 					return db.First(&bumpedSession, "ID = ?", prevSession.ID).Error
 				})
 				require.NoError(t, err)
@@ -757,7 +986,7 @@ func TestORM_DeleteUser(t *testing.T) {
 	_, err := store.FindUser()
 	require.NoError(t, err)
 
-	_, err = store.DeleteUser()
+	err = store.DeleteUser()
 	require.NoError(t, err)
 
 	_, err = store.FindUser()
@@ -867,12 +1096,12 @@ func TestBulkDeleteRuns(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
-	var resultCount int
-	var taskCount int
-	var runCount int
+	var resultCount int64
+	var taskCount int64
+	var runCount int64
 	orm := store.ORM
 
-	err := orm.RawDB(func(db *gorm.DB) error {
+	err := orm.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		job := cltest.NewJobWithWebInitiator()
 		require.NoError(t, store.ORM.CreateJob(&job))
 
@@ -919,15 +1148,15 @@ func TestBulkDeleteRuns(t *testing.T) {
 
 		err = db.Model(&models.JobRun{}).Count(&runCount).Error
 		assert.NoError(t, err)
-		assert.Equal(t, 3, runCount)
+		assert.Equal(t, 3, int(runCount))
 
 		err = db.Model(&models.TaskRun{}).Count(&taskCount).Error
 		assert.NoError(t, err)
-		assert.Equal(t, 3, taskCount)
+		assert.Equal(t, 3, int(taskCount))
 
 		err = db.Model(&models.RunResult{}).Count(&resultCount).Error
 		assert.NoError(t, err)
-		assert.Equal(t, 3, resultCount)
+		assert.Equal(t, 3, int(resultCount))
 
 		return nil
 	})
@@ -1005,7 +1234,7 @@ func TestORM_SyncDbKeyStoreToDisk(t *testing.T) {
 }
 
 const linkEthTxWithTaskRunQuery = `
-INSERT INTO eth_task_run_txes (task_run_id, eth_tx_id) VALUES ($1, $2)
+INSERT INTO eth_task_run_txes (task_run_id, eth_tx_id) VALUES (?, ?)
 `
 
 func TestORM_RemoveUnstartedTransaction(t *testing.T) {
@@ -1024,7 +1253,7 @@ func TestORM_RemoveUnstartedTransaction(t *testing.T) {
 		jobRun.Status = status
 		jobRun.TaskRuns = []models.TaskRun{
 			{
-				ID:         models.NewID(),
+				ID:         uuid.NewV4(),
 				Status:     models.RunStatusUnstarted,
 				TaskSpecID: jobSpec.Tasks[0].ID,
 			},
@@ -1047,7 +1276,7 @@ func TestORM_RemoveUnstartedTransaction(t *testing.T) {
 		ethTxAttempt.State = models.EthTxAttemptInProgress
 		require.NoError(t, storeInstance.DB.Save(&ethTxAttempt).Error)
 
-		require.NoError(t, storeInstance.DB.Exec(linkEthTxWithTaskRunQuery, jobRun.TaskRuns[0].ID.UUID(), ethTx.ID).Error)
+		require.NoError(t, storeInstance.DB.Exec(linkEthTxWithTaskRunQuery, jobRun.TaskRuns[0].ID, ethTx.ID).Error)
 	}
 
 	assert.NoError(t, ormInstance.RemoveUnstartedTransactions())
@@ -1221,7 +1450,7 @@ func TestJobs_SQLiteBatchSizeIntegrity(t *testing.T) {
 	defer cleanup()
 
 	archivedJob := cltest.NewJobWithFluxMonitorInitiator()
-	archivedJob.DeletedAt = cltest.NullableTime(time.Now())
+	archivedJob.DeletedAt = gorm.DeletedAt{Valid: true, Time: time.Now()}
 	require.NoError(t, store.CreateJob(&archivedJob))
 
 	jobs := []models.JobSpec{}
@@ -1264,18 +1493,18 @@ func TestORM_Heads_Chain(t *testing.T) {
 		} else if idx == 7 {
 			longestChainHeadHash = h.Hash
 		}
-		assert.Nil(t, store.IdempotentInsertHead(h))
+		assert.Nil(t, store.IdempotentInsertHead(context.TODO(), h))
 	}
 
 	competingHead1 := *cltest.Head(3)
 	competingHead1.ParentHash = baseOfForkHash
-	assert.Nil(t, store.IdempotentInsertHead(competingHead1))
+	assert.Nil(t, store.IdempotentInsertHead(context.TODO(), competingHead1))
 	competingHead2 := *cltest.Head(4)
 	competingHead2.ParentHash = competingHead1.Hash
-	assert.Nil(t, store.IdempotentInsertHead(competingHead2))
+	assert.Nil(t, store.IdempotentInsertHead(context.TODO(), competingHead2))
 
 	// Query for the top of the longer chain does not include the competing chain
-	h, err := store.Chain(longestChainHeadHash, 12)
+	h, err := store.Chain(context.TODO(), longestChainHeadHash, 12)
 	require.NoError(t, err)
 	assert.Equal(t, longestChainHeadHash, h.Hash)
 	count := 1
@@ -1291,7 +1520,7 @@ func TestORM_Heads_Chain(t *testing.T) {
 	assert.Equal(t, 8, count)
 
 	// If we set the limit lower we get fewer heads in chain
-	h, err = store.Chain(longestChainHeadHash, 2)
+	h, err = store.Chain(context.TODO(), longestChainHeadHash, 2)
 	require.NoError(t, err)
 	assert.Equal(t, longestChainHeadHash, h.Hash)
 	count = 1
@@ -1305,7 +1534,7 @@ func TestORM_Heads_Chain(t *testing.T) {
 	assert.Equal(t, 2, count)
 
 	// If we query for the top of the competing chain we get its parents
-	head, err := store.Chain(competingHead2.Hash, 12)
+	head, err := store.Chain(context.TODO(), competingHead2.Hash, 12)
 	require.NoError(t, err)
 	assert.Equal(t, competingHead2.Hash, head.Hash)
 	require.NotNil(t, head.Parent)
@@ -1315,7 +1544,7 @@ func TestORM_Heads_Chain(t *testing.T) {
 	assert.NotNil(t, head.Parent.Parent.Parent) // etc...
 
 	// Returns error if hash has no matches
-	_, err = store.Chain(cltest.NewHash(), 12)
+	_, err = store.Chain(context.TODO(), cltest.NewHash(), 12)
 	require.Error(t, err)
 }
 
@@ -1327,18 +1556,18 @@ func TestORM_Heads_IdempotentInsertHead(t *testing.T) {
 
 	// Returns nil when inserting first head
 	head := *cltest.Head(0)
-	require.NoError(t, store.IdempotentInsertHead(head))
+	require.NoError(t, store.IdempotentInsertHead(context.TODO(), head))
 
 	// Head is inserted
-	foundHead, err := store.LastHead()
+	foundHead, err := store.LastHead(context.TODO())
 	require.NoError(t, err)
 	assert.Equal(t, head.Hash, foundHead.Hash)
 
 	// Returns nil when inserting same head again
-	require.NoError(t, store.IdempotentInsertHead(head))
+	require.NoError(t, store.IdempotentInsertHead(context.TODO(), head))
 
 	// Head is still inserted
-	foundHead, err = store.LastHead()
+	foundHead, err = store.LastHead(context.TODO())
 	require.NoError(t, err)
 	assert.Equal(t, head.Hash, foundHead.Hash)
 }
@@ -1350,7 +1579,7 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 	// rollback due to constraint violation for this function
 	tc, orm, cleanup := cltest.BootstrapThrowawayORM(t, "eth_task_run_transactions", true, true)
 	defer cleanup()
-	store, cleanup := cltest.NewStoreWithConfig(tc)
+	store, cleanup := cltest.NewStoreWithConfig(t, tc)
 	store.ORM = orm
 	defer cleanup()
 	_, fromAddress := cltest.MustAddRandomKeyToKeystore(t, store)
@@ -1365,10 +1594,10 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 		err := store.IdempotentInsertEthTaskRunTx(sharedTaskRunID, fromAddress, toAddress, encodedPayload, gasLimit)
 		require.NoError(t, err)
 
-		etrt, err := store.FindEthTaskRunTxByTaskRunID(sharedTaskRunID.UUID())
+		etrt, err := store.FindEthTaskRunTxByTaskRunID(sharedTaskRunID)
 		require.NoError(t, err)
 
-		assert.Equal(t, sharedTaskRunID.UUID(), etrt.TaskRunID)
+		assert.Equal(t, sharedTaskRunID, etrt.TaskRunID)
 		require.NotNil(t, etrt.EthTx)
 		assert.Nil(t, etrt.EthTx.Nonce)
 		assert.Equal(t, fromAddress, etrt.EthTx.FromAddress)
@@ -1382,10 +1611,10 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 		require.NoError(t, err)
 
 		// Ensure it didn't leave a stray EthTx hanging around
-		store.RawDB(func(db *gorm.DB) error {
-			var count int
+		store.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
+			var count int64
 			require.NoError(t, db.Table("eth_txes").Count(&count).Error)
-			assert.Equal(t, 1, count)
+			assert.Equal(t, 1, int(count))
 			return nil
 		})
 	})
@@ -1416,7 +1645,7 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 		err = store.IdempotentInsertEthTaskRunTx(taskRunID, fromAddress, toAddress, encodedPayload, secondGasLimit)
 		require.NoError(t, err)
 
-		etrt, err := store.FindEthTaskRunTxByTaskRunID(taskRunID.UUID())
+		etrt, err := store.FindEthTaskRunTxByTaskRunID(taskRunID)
 		require.NoError(t, err)
 
 		// But the second insert did not change the gas limit
@@ -1468,7 +1697,7 @@ func TestORM_UpsertErrorFor_Happy(t *testing.T) {
 	store.UpsertErrorFor(job1.ID, description1)
 
 	tests := []struct {
-		jobID               *models.ID
+		jobID               models.JobID
 		description         string
 		expectedOccurrences uint
 	}{
@@ -1524,12 +1753,12 @@ func TestORM_UpsertErrorFor_Error(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		jobID       *models.ID
+		jobID       models.JobID
 		description string
 	}{
 		{
 			"missing job",
-			models.NewID(),
+			models.NewJobID(),
 			description,
 		},
 		{
@@ -1652,7 +1881,8 @@ func TestORM_UpdateFluxMonitorRoundStats(t *testing.T) {
 		fmrs, err := store.FindOrCreateFluxMonitorRoundStats(address, roundID)
 		require.NoError(t, err)
 		require.Equal(t, expectedCount, fmrs.NumSubmissions)
-		require.Equal(t, jobRun.ID, fmrs.JobRunID)
+		require.True(t, fmrs.JobRunID.Valid)
+		require.Equal(t, jobRun.ID, fmrs.JobRunID.UUID)
 	}
 }
 
@@ -1711,22 +1941,42 @@ func TestORM_GetRoundRobinAddress(t *testing.T) {
 	})
 }
 
-func TestORM_MarkLogConsumed(t *testing.T) {
+func TestORM_SetConfigStrValue(t *testing.T) {
 	t.Parallel()
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	orm := store.ORM
 
-	blockHash := cltest.NewHash()
-	logIndex := uint(42)
-	job := cltest.MustInsertJobSpec(t, store)
-	blockNumber := uint64(142)
+	fieldName := "LogSQLStatements"
+	name := orm.EnvVarName(fieldName)
+	isSqlStatementEnabled := true
+	res := models.Configuration{}
 
-	require.NoError(t, orm.MarkLogConsumed(blockHash, logIndex, job.ID, blockNumber))
-
-	res, err := orm.DB.DB().Exec(`SELECT * FROM log_consumptions;`)
+	// Store db config entry as true
+	err := store.SetConfigStrValue(context.TODO(), fieldName, strconv.FormatBool(isSqlStatementEnabled))
 	require.NoError(t, err)
-	rowsaffected, err := res.RowsAffected()
+
+	err = store.DB.First(&res, "name = ?", name).Error
 	require.NoError(t, err)
-	require.Equal(t, int64(1), rowsaffected)
+	require.Equal(t, strconv.FormatBool(isSqlStatementEnabled), res.Value)
+
+	// Update db config entry as false
+	isSqlStatementEnabled = false
+	err = store.SetConfigStrValue(context.TODO(), fieldName, strconv.FormatBool(isSqlStatementEnabled))
+	require.NoError(t, err)
+
+	err = store.DB.First(&res, "name = ?", name).Error
+	require.NoError(t, err)
+	require.Equal(t, strconv.FormatBool(isSqlStatementEnabled), res.Value)
+}
+
+func TestORM_GetConfigBoolValue(t *testing.T) {
+	t.Parallel()
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+	store.Config.SetRuntimeStore(store.ORM)
+
+	isSqlStatementEnabled := true
+	err := store.Config.SetLogSQLStatements(context.TODO(), isSqlStatementEnabled)
+	require.NoError(t, err)
+	assert.Equal(t, isSqlStatementEnabled, store.Config.LogSQLStatements())
 }

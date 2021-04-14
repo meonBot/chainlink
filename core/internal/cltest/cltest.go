@@ -17,17 +17,23 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/mock"
+	"github.com/smartcontractkit/chainlink/core/store/dialects"
+
+	"github.com/smartcontractkit/chainlink/core/services"
+	"github.com/smartcontractkit/chainlink/core/services/job"
+	"github.com/smartcontractkit/chainlink/core/static"
 
 	p2ppeer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/smartcontractkit/chainlink/core/assets"
 	"github.com/smartcontractkit/chainlink/core/auth"
 	"github.com/smartcontractkit/chainlink/core/cmd"
 	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
+	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
@@ -41,27 +47,33 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/smartcontractkit/chainlink/core/web"
+	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
 
 	"github.com/DATA-DOG/go-txdb"
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind/backends"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/gin-gonic/gin"
 	"github.com/gobuffalo/packr"
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
 	"github.com/gorilla/websocket"
-	"github.com/jinzhu/gorm"
 	"github.com/manyminds/api2go/jsonapi"
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap/zapcore"
 	null "gopkg.in/guregu/null.v4"
+	"gorm.io/gorm"
 )
 
 const (
@@ -74,33 +86,34 @@ const (
 	// APIEmail is the email of the fixture API user
 	APIEmail = "apiuser@chainlink.test"
 	// Password just a password we use everywhere for testing
-	Password = "password"
+	Password = "p4SsW0rD1!@#_"
 	// SessionSecret is the hardcoded secret solely used for test
 	SessionSecret = "clsession_test_secret"
+	// DefaultKeyAddress is the ETH address of the fixture key
+	DefaultKeyAddress = "0xF67D0290337bca0847005C7ffD1BC75BA9AAE6e4"
 	// DefaultKeyFixtureFileName is the filename of the fixture key
-	DefaultKeyFixtureFileName = "testkey-27548a32b9aD5D64c5945EaE9Da5337bc3169D15.json"
+	DefaultKeyFixtureFileName = "testkey-0xF67D0290337bca0847005C7ffD1BC75BA9AAE6e4.json"
+	// DefaultKeyJSON is the JSON for the default key encrypted with fast scrypt and password 'password' (used for fixture file)
+	DefaultKeyJSON = `{"address":"F67D0290337bca0847005C7ffD1BC75BA9AAE6e4","crypto":{"cipher":"aes-128-ctr","ciphertext":"9c3565050ba4e10ea388bcd17d77c141441ce1be5db339f0201b9ed733d780c6","cipherparams":{"iv":"f968fc947495646ee8b5dbaadb242ec0"},"kdf":"scrypt","kdfparams":{"dklen":32,"n":262144,"p":1,"r":8,"salt":"33ad88742a983dfeb8adcc9a39fdde4cb47f7e23ea2ef80b35723d940959e3fd"},"mac":"b3747959cbbb9b26f861ab82d69154b4ec8108bbac017c1341f6fd3295beceaf"},"id":"8c79a654-96b1-45d9-8978-3efa07578011","version":3}`
 	// AllowUnstarted enable an application that can be used in tests without being started
 	AllowUnstarted = "allow_unstarted"
 	// DefaultPeerID is the peer ID of the fixture p2p key
-	DefaultPeerID = "12D3KooWCJUPKsYAnCRTQ7SUNULt4Z9qF8Uk1xadhCs7e9M711Lp"
+	DefaultPeerID = "12D3KooWApUJaQB2saFjyEUfq6BmysnsSnhLnY5CF9tURYVKgoXK"
 	// A peer ID without an associated p2p key.
 	NonExistentPeerID = "12D3KooWAdCzaesXyezatDzgGvCngqsBqoUqnV9PnVc46jsVt2i9"
 	// DefaultOCRKeyBundleID is the ID of the fixture ocr key bundle
-	DefaultOCRKeyBundleID = "54f02f2756952ee42874182c8a03d51f048b7fc245c05196af50f9266f8e444a"
-	// DefaultKeyJSON is the JSON for the default key encrypted with fast scrypt and password 'password' (used for fixture file)
-	DefaultKeyJSON = `{"id": "1ccf542e-8f4d-48a0-ad1d-b4e6a86d4c6d", "crypto": {"kdf": "scrypt", "mac": "7f31bd05768a184278c4e9f077bcfba7b2003fed585b99301374a1a4a9adff25", "cipher": "aes-128-ctr", "kdfparams": {"n": 2, "p": 1, "r": 8, "salt": "99e83bf0fdeba39bd29c343db9c52d9e0eae536fdaee472d3181eac1968aa1f9", "dklen": 32}, "ciphertext": "ac22fa788b53a5f62abda03cd432c7aee1f70053b97633e78f93709c383b2a46", "cipherparams": {"iv": "6699ba30f953728787e51a754d6f9566"}}, "address": "27548a32b9ad5d64c5945eae9da5337bc3169d15", "version": 3}`
+	DefaultOCRKeyBundleID = "7f993fb701b3410b1f6e8d4d93a7462754d24609b9b31a4fe64a0cb475a4d934"
 )
 
 var (
-	DefaultP2PPeerID     p2ppeer.ID
-	NonExistentP2PPeerID p2ppeer.ID
+	DefaultP2PPeerID     models.PeerID
+	NonExistentP2PPeerID models.PeerID
 	// DefaultOCRKeyBundleIDSha256 is the ID of the fixture ocr key bundle
 	DefaultOCRKeyBundleIDSha256 models.Sha256Hash
+	FluxAggAddress              = common.HexToAddress("0x3cCad4715152693fE3BC4460591e3D3Fbd071b42")
+	storeCounter                uint64
+	minimumContractPayment      = assets.NewLink(100)
 )
-
-var storeCounter uint64
-
-var minimumContractPayment = assets.NewLink(100)
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -111,9 +124,9 @@ func init() {
 	// See: DialectTransactionWrappedPostgres
 	config := orm.NewConfig()
 
-	parsed, err := url.Parse(config.DatabaseURL())
-	if err != nil || parsed.Path == "" {
-		msg := fmt.Sprintf("invalid DATABASE_URL: `%s`. You must set DATABASE_URL env var to point to your test database. Note that the test database MUST end in `_test` to differentiate from a possible production DB. HINT: Try DATABASE_URL=postgresql://postgres@localhost:5432/chainlink_test?sslmode=disable", config.DatabaseURL())
+	parsed := config.DatabaseURL()
+	if parsed.Path == "" {
+		msg := fmt.Sprintf("invalid DATABASE_URL: `%s`. You must set DATABASE_URL env var to point to your test database. Note that the test database MUST end in `_test` to differentiate from a possible production DB. HINT: Try DATABASE_URL=postgresql://postgres@localhost:5432/chainlink_test?sslmode=disable", parsed.String())
 		panic(msg)
 	}
 	if !strings.HasSuffix(parsed.Path, "_test") {
@@ -127,7 +140,7 @@ func init() {
 	// If you MUST test BEGIN/ROLLBACK behaviour, you will have to configure your
 	// store to use the raw DialectPostgres dialect and setup a one-use database.
 	// See BootstrapThrowawayORM() as a convenience function to help you do this.
-	txdb.Register("cloudsqlpostgres", "postgres", config.DatabaseURL(), txdb.SavePointOption(nil))
+	txdb.Register(string(dialects.TransactionWrappedPostgres), string(dialects.Postgres), parsed.String(), txdb.SavePointOption(nil))
 
 	// Seed the random number generator, otherwise separate modules will take
 	// the same advisory locks when tested with `go test -p N` for N > 1
@@ -135,14 +148,16 @@ func init() {
 	logger.Debugf("Using seed: %v", seed)
 	rand.Seed(seed)
 
-	DefaultP2PPeerID, err = p2ppeer.Decode(DefaultPeerID)
+	defaultP2PPeerID, err := p2ppeer.Decode(DefaultPeerID)
 	if err != nil {
 		panic(err)
 	}
-	NonExistentP2PPeerID, err = p2ppeer.Decode(NonExistentPeerID)
+	DefaultP2PPeerID = models.PeerID(defaultP2PPeerID)
+	nonExistentP2PPeerID, err := p2ppeer.Decode(NonExistentPeerID)
 	if err != nil {
 		panic(err)
 	}
+	NonExistentP2PPeerID = models.PeerID(nonExistentP2PPeerID)
 	DefaultOCRKeyBundleIDSha256, err = models.Sha256HashFromHex(DefaultOCRKeyBundleID)
 	if err != nil {
 		panic(err)
@@ -172,12 +187,28 @@ func NewConfig(t testing.TB) (*TestConfig, func()) {
 	config := NewConfigWithWSServer(t, url, wsserver)
 	// Tests almost always want to request to localhost so its easier to set this here
 	config.Set("DEFAULT_HTTP_ALLOW_UNRESTRICTED_NETWORK_ACCESS", true)
+	// Disable gas updater for application tests
+	config.Set("GAS_UPDATER_ENABLED", false)
+	// Disable tx re-sending for application tests
+	config.Set("ETH_TX_RESEND_AFTER_THRESHOLD", 0)
 	return config, cleanup
 }
 
 func NewRandomInt64() int64 {
 	id := rand.Int63()
 	return id
+}
+
+func MustRandomBytes(t *testing.T, l int) (b []byte) {
+	t.Helper()
+
+	b = make([]byte, l)
+	/* #nosec G404 */
+	_, err := rand.Read(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // NewTestConfig returns a test configuration
@@ -188,10 +219,10 @@ func NewTestConfig(t testing.TB, options ...interface{}) *TestConfig {
 	rootdir := filepath.Join(RootDir, fmt.Sprintf("%d-%d", time.Now().UnixNano(), count))
 	rawConfig := orm.NewConfig()
 
-	rawConfig.Dialect = orm.DialectTransactionWrappedPostgres
+	rawConfig.Dialect = dialects.TransactionWrappedPostgres
 	for _, opt := range options {
 		switch v := opt.(type) {
-		case orm.DialectName:
+		case dialects.DialectName:
 			rawConfig.Dialect = v
 		}
 	}
@@ -213,6 +244,11 @@ func NewTestConfig(t testing.TB, options ...interface{}) *TestConfig {
 	rawConfig.Set("INSECURE_FAST_SCRYPT", "true")
 	rawConfig.Set("BALANCE_MONITOR_ENABLED", "false")
 	rawConfig.Set("P2P_LISTEN_PORT", "12345")
+	rawConfig.Set("P2P_PEER_ID", DefaultP2PPeerID.String())
+	rawConfig.Set("DATABASE_TIMEOUT", "5s")
+	rawConfig.Set("GLOBAL_LOCK_RETRY_INTERVAL", "10ms")
+	rawConfig.Set("ORM_MAX_OPEN_CONNS", "5")
+	rawConfig.Set("ORM_MAX_IDLE_CONNS", "2")
 	rawConfig.SecretGenerator = mockSecretGenerator{}
 	config := TestConfig{t: t, Config: rawConfig}
 	return &config
@@ -358,20 +394,25 @@ func NewApplicationWithConfig(t testing.TB, tc *TestConfig, flagsAndDeps ...inte
 
 	var ethClient eth.Client = &eth.NullClient{}
 	var advisoryLocker postgres.AdvisoryLocker = &postgres.NullAdvisoryLocker{}
+	var externalInitiatorManager chainlink.ExternalInitiatorManager = &services.NullExternalInitiatorManager{}
 	for _, flag := range flagsAndDeps {
 		switch dep := flag.(type) {
 		case eth.Client:
 			ethClient = dep
 		case postgres.AdvisoryLocker:
 			advisoryLocker = dep
+		case chainlink.ExternalInitiatorManager:
+			externalInitiatorManager = dep
 		}
 	}
 
 	ta := &TestApplication{t: t, connectedChannel: make(chan struct{}, 1)}
 
-	app := chainlink.NewApplication(tc.Config, ethClient, advisoryLocker, strpkg.InsecureKeyStoreGen, func(app chainlink.Application) {
+	appInstance, err := chainlink.NewApplication(tc.Config, ethClient, advisoryLocker, strpkg.InsecureKeyStoreGen, externalInitiatorManager, func(app chainlink.Application) {
 		ta.connectedChannel <- struct{}{}
-	}).(*chainlink.ChainlinkApplication)
+	})
+	require.NoError(t, err)
+	app := appInstance.(*chainlink.ChainlinkApplication)
 	ta.ChainlinkApplication = app
 	server := newServer(ta)
 
@@ -389,27 +430,8 @@ func NewApplicationWithConfig(t testing.TB, tc *TestConfig, flagsAndDeps ...inte
 	ta.Server = server
 	ta.wsServer = tc.wsServer
 	return ta, func() {
-		assert.NoError(t, ta.StopIfStarted())
+		ta.StopIfStarted()
 	}
-}
-
-func NewApplicationWithConfigAndKeyOnSimulatedBlockchain(
-	t testing.TB,
-	tc *TestConfig,
-	backend *backends.SimulatedBackend,
-	flagsAndDeps ...interface{},
-) (app *TestApplication, cleanup func()) {
-	chainId := int(backend.Blockchain().Config().ChainID.Int64())
-	tc.Config.Set("ETH_CHAIN_ID", chainId)
-
-	client := &SimulatedBackendClient{b: backend, t: t, chainId: chainId}
-	flagsAndDeps = append(flagsAndDeps, client)
-
-	app, appCleanup := NewApplicationWithConfigAndKey(t, tc, flagsAndDeps...)
-	err := app.Store.KeyStore.Unlock(Password)
-	require.NoError(t, err)
-
-	return app, func() { appCleanup(); client.Close() }
 }
 
 func NewEthMocks(t testing.TB) (*mocks.RPCClient, *mocks.GethClient, *mocks.Subscription, func()) {
@@ -433,6 +455,7 @@ func NewEthMocks(t testing.TB) (*mocks.RPCClient, *mocks.GethClient, *mocks.Subs
 func NewEthMocksWithStartupAssertions(t testing.TB) (*mocks.RPCClient, *mocks.GethClient, *mocks.Subscription, func()) {
 	r, g, s, assertMocksCalled := NewEthMocks(t)
 	g.On("ChainID", mock.Anything).Return(NewTestConfig(t).ChainID(), nil)
+	g.On("PendingNonceAt", mock.Anything, mock.Anything).Return(uint64(0), nil).Maybe()
 	r.On("EthSubscribe", mock.Anything, mock.Anything, "newHeads").Return(EmptyMockSubscription(), nil)
 	s.On("Err").Return(nil).Maybe()
 	s.On("Unsubscribe").Return(nil).Maybe()
@@ -493,7 +516,7 @@ func (ta *TestApplication) Stop() error {
 	// TODO: Here we double close, which is less than ideal.
 	// We would prefer to invoke a method on an interface that
 	// cleans up only in test.
-	require.NoError(ta.t, ta.ChainlinkApplication.StopIfStarted())
+	ta.ChainlinkApplication.StopIfStarted()
 	cleanUpStore(ta.t, ta.Store)
 	if ta.Server != nil {
 		ta.Server.Close()
@@ -557,7 +580,7 @@ func (ta *TestApplication) NewAuthenticatingClient(prompter cmd.Prompter) *cmd.C
 		KeyStoreAuthenticator:          CallbackAuthenticator{func(*strpkg.Store, string) (string, error) { return Password, nil }},
 		FallbackAPIInitializer:         &MockAPIInitializer{},
 		Runner:                         EmptyRunner{},
-		HTTP:                           cmd.NewAuthenticatedHTTPClient(ta.Config, cookieAuth),
+		HTTP:                           cmd.NewAuthenticatedHTTPClient(ta.Config, cookieAuth, models.SessionRequest{}),
 		CookieAuthenticator:            cookieAuth,
 		FileSessionRequestBuilder:      cmd.NewFileSessionRequestBuilder(),
 		PromptingSessionRequestBuilder: cmd.NewPromptingSessionRequestBuilder(prompter),
@@ -584,7 +607,9 @@ func (ta *TestApplication) MustCreateJobRun(txHashBytes []byte, blockHashBytes [
 }
 
 // NewStoreWithConfig creates a new store with given config
-func NewStoreWithConfig(config *TestConfig, flagsAndDeps ...interface{}) (*strpkg.Store, func()) {
+func NewStoreWithConfig(t testing.TB, config *TestConfig, flagsAndDeps ...interface{}) (*strpkg.Store, func()) {
+	t.Helper()
+
 	var advisoryLocker postgres.AdvisoryLocker = &postgres.NullAdvisoryLocker{}
 	for _, flag := range flagsAndDeps {
 		switch dep := flag.(type) {
@@ -592,7 +617,10 @@ func NewStoreWithConfig(config *TestConfig, flagsAndDeps ...interface{}) (*strpk
 			advisoryLocker = dep
 		}
 	}
-	s := strpkg.NewInsecureStore(config.Config, &eth.NullClient{}, advisoryLocker, gracefulpanic.NewSignal())
+	s, err := strpkg.NewInsecureStore(config.Config, &eth.NullClient{}, advisoryLocker, gracefulpanic.NewSignal())
+	if err != nil {
+		require.NoError(t, err)
+	}
 	return s, func() {
 		cleanUpStore(config.t, s)
 	}
@@ -603,7 +631,7 @@ func NewStore(t testing.TB, flagsAndDeps ...interface{}) (*strpkg.Store, func())
 	t.Helper()
 
 	c, cleanup := NewConfig(t)
-	store, storeCleanup := NewStoreWithConfig(c, flagsAndDeps...)
+	store, storeCleanup := NewStoreWithConfig(t, c, flagsAndDeps...)
 	return store, func() {
 		storeCleanup()
 		cleanup()
@@ -775,6 +803,34 @@ func CreateSpecViaWeb(t testing.TB, app *TestApplication, spec string) models.Jo
 	return createdJob
 }
 
+func CreateJobViaWeb(t testing.TB, app *TestApplication, request []byte) job.Job {
+	t.Helper()
+
+	client := app.NewHTTPClient()
+	resp, cleanup := client.Post("/v2/jobs", bytes.NewBuffer(request))
+	defer cleanup()
+	AssertServerResponse(t, resp, http.StatusOK)
+
+	var createdJob job.Job
+	err := ParseJSONAPIResponse(t, resp, &createdJob)
+	require.NoError(t, err)
+	return createdJob
+}
+
+func CreateJobViaWeb2(t testing.TB, app *TestApplication, spec string) webpresenters.JobResource {
+	t.Helper()
+
+	client := app.NewHTTPClient()
+	resp, cleanup := client.Post("/v2/jobs", bytes.NewBufferString(spec))
+	defer cleanup()
+	AssertServerResponse(t, resp, http.StatusOK)
+
+	var jobResponse webpresenters.JobResource
+	err := ParseJSONAPIResponse(t, resp, &jobResponse)
+	require.NoError(t, err)
+	return jobResponse
+}
+
 // CreateJobRunViaWeb creates JobRun via web using /v2/specs/ID/runs
 func CreateJobRunViaWeb(t testing.TB, app *TestApplication, j models.JobSpec, body ...string) models.JobRun {
 	t.Helper()
@@ -805,8 +861,8 @@ func CreateJobRunViaExternalInitiator(
 	t.Helper()
 
 	headers := make(map[string]string)
-	headers[web.ExternalInitiatorAccessKeyHeader] = eia.AccessKey
-	headers[web.ExternalInitiatorSecretHeader] = eia.Secret
+	headers[static.ExternalInitiatorAccessKeyHeader] = eia.AccessKey
+	headers[static.ExternalInitiatorSecretHeader] = eia.Secret
 
 	url := app.Config.ClientNodeURL() + "/v2/specs/" + j.ID.String() + "/runs"
 	bodyBuf := bytes.NewBufferString(body)
@@ -905,9 +961,14 @@ func CreateExternalInitiatorViaWeb(
 }
 
 const (
-	DBWaitTimeout = 10 * time.Second
+	// DBWaitTimeout is how long we wait by default for something to appear in
+	// the DB. It needs to be fairly long because integration
+	// tests rely on it.
+	DBWaitTimeout = 20 * time.Second
 	// DBPollingInterval can't be too short to avoid DOSing the test database
 	DBPollingInterval = 100 * time.Millisecond
+	// AssertNoActionTimeout shouldn't be too long, or it will slow down tests
+	AssertNoActionTimeout = 3 * time.Second
 )
 
 // WaitForJobRunToComplete waits for a JobRun to reach Completed Status
@@ -952,12 +1013,37 @@ func WaitForJobRunToPendOutgoingConfirmations(
 	return WaitForJobRunStatus(t, store, jr, models.RunStatusPendingOutgoingConfirmations)
 }
 
+func SendBlocksUntilComplete(
+	t testing.TB,
+	store *strpkg.Store,
+	jr models.JobRun,
+	blockCh chan<- *models.Head,
+	start int64,
+	gethClient *mocks.GethClient,
+) models.JobRun {
+	t.Helper()
+
+	var err error
+	block := start
+	gomega.NewGomegaWithT(t).Eventually(func() models.RunStatus {
+		h := models.NewHead(big.NewInt(block), NewHash(), NewHash(), 0)
+		blockCh <- &h
+		block++
+		jr, err = store.Unscoped().FindJobRun(jr.ID)
+		assert.NoError(t, err)
+		st := jr.GetStatus()
+		return st
+	}, DBWaitTimeout, DBPollingInterval).Should(gomega.Equal(models.RunStatusCompleted))
+	return jr
+}
+
 // WaitForJobRunStatus waits for a JobRun to reach given status
 func WaitForJobRunStatus(
 	t testing.TB,
 	store *strpkg.Store,
 	jr models.JobRun,
 	status models.RunStatus,
+
 ) models.JobRun {
 	t.Helper()
 
@@ -1006,6 +1092,39 @@ func JobRunStaysPendingIncomingConfirmations(
 	return JobRunStays(t, store, jr, models.RunStatusPendingIncomingConfirmations)
 }
 
+// Polls until the passed in jobID has count number
+// of job spec errors.
+func WaitForSpecError(t *testing.T, store *strpkg.Store, jobID models.JobID, count int) []models.JobSpecError {
+	t.Helper()
+	g := gomega.NewGomegaWithT(t)
+	var jse []models.JobSpecError
+	g.Eventually(func() []models.JobSpecError {
+		err := store.DB.
+			Where("job_spec_id = ?", jobID.String()).
+			Find(&jse).Error
+		assert.NoError(t, err)
+		return jse
+	}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(count))
+	return jse
+}
+
+// WaitForSpecErrorV2 polls until the passed in jobID has count number
+// of job spec errors.
+func WaitForSpecErrorV2(t *testing.T, store *strpkg.Store, jobID int32, count int) []job.SpecError {
+	t.Helper()
+
+	g := gomega.NewGomegaWithT(t)
+	var jse []job.SpecError
+	g.Eventually(func() []job.SpecError {
+		err := store.DB.
+			Where("job_id = ?", jobID).
+			Find(&jse).Error
+		assert.NoError(t, err)
+		return jse
+	}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(count))
+	return jse
+}
+
 // WaitForRuns waits for the wanted number of runs then returns a slice of the JobRuns
 func WaitForRuns(t testing.TB, j models.JobSpec, store *strpkg.Store, want int) []models.JobRun {
 	t.Helper()
@@ -1018,7 +1137,7 @@ func WaitForRuns(t testing.TB, j models.JobSpec, store *strpkg.Store, want int) 
 			jrs, err = store.JobRunsFor(j.ID)
 			assert.NoError(t, err)
 			return jrs
-		}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
+		}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
 	} else {
 		g.Eventually(func() []models.JobRun {
 			jrs, err = store.JobRunsFor(j.ID)
@@ -1027,6 +1146,45 @@ func WaitForRuns(t testing.TB, j models.JobSpec, store *strpkg.Store, want int) 
 		}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
 	}
 	return jrs
+}
+
+func WaitForPipelineRuns(t testing.TB, nodeID int, jobID int32, jo job.ORM, want int, timeout, poll time.Duration) []pipeline.Run {
+	t.Helper()
+
+	var err error
+	prs := []pipeline.Run{}
+	gomega.NewGomegaWithT(t).Eventually(func() []pipeline.Run {
+		prs, _, err = jo.PipelineRunsByJobID(jobID, 0, 1000)
+		assert.NoError(t, err)
+		return prs
+	}, timeout, poll).Should(gomega.HaveLen(want))
+
+	return prs
+}
+
+func WaitForPipelineComplete(t testing.TB, nodeID int, jobID int32, count int, jo job.ORM, timeout, poll time.Duration) []pipeline.Run {
+	t.Helper()
+
+	var pr []pipeline.Run
+	gomega.NewGomegaWithT(t).Eventually(func() bool {
+		prs, _, err := jo.PipelineRunsByJobID(jobID, 0, 1000)
+		assert.NoError(t, err)
+		var completed []pipeline.Run
+
+		for i := range prs {
+			if !prs[i].Outputs.Null {
+				if !prs[i].Errors.HasError() {
+					completed = append(completed, prs[i])
+				}
+			}
+		}
+		if len(completed) >= count {
+			pr = completed
+			return true
+		}
+		return false
+	}, timeout, poll).Should(gomega.BeTrue(), fmt.Sprintf("job %d on node %d not complete with %d runs", jobID, nodeID, count))
+	return pr
 }
 
 // AssertRunsStays asserts that the number of job runs for a particular job remains at the provided values
@@ -1040,8 +1198,24 @@ func AssertRunsStays(t testing.TB, j models.JobSpec, store *strpkg.Store, want i
 		jrs, err = store.JobRunsFor(j.ID)
 		assert.NoError(t, err)
 		return jrs
-	}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
+	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
 	return jrs
+}
+
+// AssertPipelineRunsStays asserts that the number of pipeline runs for a particular job remains at the provided values
+func AssertPipelineRunsStays(t testing.TB, pipelineSpecID int32, store *strpkg.Store, want int) []pipeline.Run {
+	t.Helper()
+	g := gomega.NewGomegaWithT(t)
+
+	var prs []pipeline.Run
+	g.Consistently(func() []pipeline.Run {
+		err := store.DB.
+			Where("pipeline_spec_id = ?", pipelineSpecID).
+			Find(&prs).Error
+		assert.NoError(t, err)
+		return prs
+	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
+	return prs
 }
 
 // WaitForRunsAtLeast waits for at least the passed number of runs to start.
@@ -1099,15 +1273,8 @@ func AssertEthTxAttemptCountStays(t testing.TB, store *strpkg.Store, want int) [
 		err = store.DB.Find(&txas).Error
 		assert.NoError(t, err)
 		return txas
-	}, DBWaitTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
+	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.HaveLen(want))
 	return txas
-}
-
-func WaitForTxInMempool(t *testing.T, client *backends.SimulatedBackend, txHash common.Hash) {
-	gomega.NewGomegaWithT(t).Eventually(func() bool {
-		_, isPending, err := client.TransactionByHash(context.TODO(), txHash)
-		return err == nil && isPending
-	}, 5*time.Second, 100*time.Millisecond).Should(gomega.BeTrue())
 }
 
 // WaitForSyncEventCount checks if the sync event count eventually reaches
@@ -1137,7 +1304,7 @@ func AssertSyncEventCountStays(
 		count, err := orm.CountOf(&models.SyncEvent{})
 		assert.NoError(t, err)
 		return count
-	}, DBWaitTimeout, DBPollingInterval).Should(gomega.Equal(want))
+	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.Equal(want))
 }
 
 // ParseISO8601 given the time string it Must parse the time and return it
@@ -1178,6 +1345,15 @@ func Head(val interface{}) *models.Head {
 		logger.Panicf("Could not convert %v of type %T to Head", val, val)
 	}
 	return &h
+}
+
+// TransactionsFromGasPrices returns transactions matching the given gas prices
+func TransactionsFromGasPrices(gasPrices ...int64) []types.Transaction {
+	txs := make([]types.Transaction, len(gasPrices))
+	for i, gasPrice := range gasPrices {
+		txs[i] = *types.NewTransaction(0, common.Address{}, nil, 0, big.NewInt(gasPrice), nil)
+	}
+	return txs
 }
 
 // BlockWithTransactions returns a new ethereum block with transactions
@@ -1315,7 +1491,7 @@ func AllExternalInitiators(t testing.TB, store *strpkg.Store) []models.ExternalI
 	t.Helper()
 
 	var all []models.ExternalInitiator
-	err := store.RawDB(func(db *gorm.DB) error {
+	err := store.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		return db.Find(&all).Error
 	})
 	require.NoError(t, err)
@@ -1326,7 +1502,7 @@ func AllJobs(t testing.TB, store *strpkg.Store) []models.JobSpec {
 	t.Helper()
 
 	var all []models.JobSpec
-	err := store.ORM.RawDB(func(db *gorm.DB) error {
+	err := store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		return db.Find(&all).Error
 	})
 	require.NoError(t, err)
@@ -1348,8 +1524,8 @@ func GetLastEthTxAttempt(t testing.TB, store *strpkg.Store) models.EthTxAttempt 
 	t.Helper()
 
 	var txa models.EthTxAttempt
-	var count int
-	err := store.ORM.RawDB(func(db *gorm.DB) error {
+	var count int64
+	err := store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		return db.Order("created_at desc").First(&txa).Count(&count).Error
 	})
 	require.NoError(t, err)
@@ -1363,11 +1539,18 @@ func NewAwaiter() Awaiter { return make(Awaiter) }
 
 func (a Awaiter) ItHappened() { close(a) }
 
-func (a Awaiter) AwaitOrFail(t testing.TB, d time.Duration) {
+func (a Awaiter) AwaitOrFail(t testing.TB, durationParams ...time.Duration) {
+	t.Helper()
+
+	duration := 10 * time.Second
+	if len(durationParams) > 0 {
+		duration = durationParams[0]
+	}
+
 	select {
 	case <-a:
-	case <-time.After(d):
-		t.Fatal("timed out")
+	case <-time.After(duration):
+		t.Fatal("Timed out waiting for Awaiter to get ItHappened")
 	}
 }
 
@@ -1406,6 +1589,39 @@ func MustResultString(t *testing.T, input models.RunResult) string {
 	return result.String()
 }
 
+// GenericEncode eth encodes values based on the provided types
+func GenericEncode(types []string, values ...interface{}) ([]byte, error) {
+	if len(values) != len(types) {
+		return nil, errors.New("must include same number of values as types")
+	}
+	var args abi.Arguments
+	for _, t := range types {
+		ty, _ := abi.NewType(t, "", nil)
+		args = append(args, abi.Argument{Type: ty})
+	}
+	out, err := args.PackValues(values)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func MustGenericEncode(types []string, values ...interface{}) []byte {
+	if len(values) != len(types) {
+		panic("must include same number of values as types")
+	}
+	var args abi.Arguments
+	for _, t := range types {
+		ty, _ := abi.NewType(t, "", nil)
+		args = append(args, abi.Argument{Type: ty})
+	}
+	out, err := args.PackValues(values)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
 func MakeRoundStateReturnData(
 	roundID uint64,
 	eligible bool,
@@ -1425,6 +1641,23 @@ func MakeRoundStateReturnData(
 	data = append(data, utils.EVMWordUint64(oracleCount)...)
 	data = append(data, utils.EVMWordUint64(paymentAmount)...)
 	return data
+}
+
+var fluxAggregatorABI = eth.MustGetABI(flux_aggregator_wrapper.FluxAggregatorABI)
+
+func MockFluxAggCall(client *mocks.GethClient, address common.Address, funcName string) *mock.Call {
+	funcSig := hexutil.Encode(fluxAggregatorABI.Methods[funcName].ID)
+	if len(funcSig) != 10 {
+		panic(fmt.Sprintf("Unable to find FluxAgg function with name %s", funcName))
+	}
+	return client.On(
+		"CallContract",
+		mock.Anything,
+		mock.MatchedBy(func(callArgs ethereum.CallMsg) bool {
+			return *callArgs.To == address &&
+				hexutil.Encode(callArgs.Data)[0:10] == funcSig
+		}),
+		mock.Anything)
 }
 
 // EthereumLogIterator is the interface provided by gethwrapper representations of EVM
@@ -1487,6 +1720,7 @@ func MockApplicationEthCalls(t *testing.T, app *TestApplication, ethClient *mock
 	sub.On("Err").Return(nil)
 	ethClient.On("SubscribeNewHead", mock.Anything, mock.Anything).Return(sub, nil)
 	ethClient.On("ChainID", mock.Anything).Return(app.Store.Config.ChainID(), nil)
+	ethClient.On("PendingNonceAt", mock.Anything, mock.Anything).Return(uint64(0), nil).Maybe()
 
 	// Stop
 	sub.On("Unsubscribe").Return(nil)
@@ -1504,4 +1738,189 @@ func MockSubscribeToLogsCh(gethClient *mocks.GethClient, sub *mocks.Subscription
 			logsCh <- args.Get(2).(chan<- types.Log)
 		})
 	return logsCh
+}
+
+func MustNewJSONSerializable(t *testing.T, s string) pipeline.JSONSerializable {
+	t.Helper()
+
+	js := new(pipeline.JSONSerializable)
+	err := js.UnmarshalJSON([]byte(s))
+	require.NoError(t, err)
+	return *js
+}
+
+func BatchElemMatchesHash(req rpc.BatchElem, hash common.Hash) bool {
+	return req.Method == "eth_getTransactionReceipt" &&
+		len(req.Args) == 1 && req.Args[0] == hash
+}
+
+type SimulateIncomingHeadsArgs struct {
+	StartBlock, EndBlock int64
+	BackfillDepth        int64
+	Interval             time.Duration
+	Timeout              time.Duration
+	HeadTrackables       []strpkg.HeadTrackable
+	Hashes               map[int64]common.Hash
+}
+
+func SimulateIncomingHeads(t *testing.T, args SimulateIncomingHeadsArgs) (cleanup func()) {
+	t.Helper()
+
+	if args.BackfillDepth == 0 {
+		t.Fatal("BackfillDepth must be > 0")
+	}
+
+	// Build the full chain of heads
+	heads := make(map[int64]*models.Head)
+	first := args.StartBlock - args.BackfillDepth
+	if first < 0 {
+		first = 0
+	}
+	last := args.EndBlock
+	if last == 0 {
+		last = args.StartBlock + 300 // If no .EndBlock is provided, assume we want 300 heads
+	}
+	for i := first; i <= last; i++ {
+		// If a particular block should have a particular
+		// hash, use that. Otherwise, generate a random one.
+		var hash common.Hash
+		if args.Hashes != nil {
+			if h, exists := args.Hashes[i]; exists {
+				hash = h
+			}
+		}
+		if hash == (common.Hash{}) {
+			hash = NewHash()
+		}
+		heads[i] = &models.Head{Hash: hash, Number: i}
+		if i > first {
+			heads[i].Parent = heads[i-1]
+		}
+	}
+
+	if args.Timeout == 0 {
+		args.Timeout = 60 * time.Second
+	}
+	if args.Interval == 0 {
+		args.Interval = 250 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), args.Timeout)
+	defer cancel()
+	chTimeout := time.After(args.Timeout)
+
+	chDone := make(chan struct{})
+	go func() {
+		current := int64(args.StartBlock)
+		for {
+			select {
+			case <-chDone:
+				return
+			case <-chTimeout:
+				return
+			default:
+				// Trim chain to backfill depth
+				ptr := heads[current]
+				for i := int64(0); i < args.BackfillDepth && ptr.Parent != nil; i++ {
+					ptr = ptr.Parent
+				}
+				ptr.Parent = nil
+
+				for _, ht := range args.HeadTrackables {
+					ht.OnNewLongestChain(ctx, *heads[current])
+				}
+				if args.EndBlock >= 0 && current == args.EndBlock {
+					return
+				}
+				current++
+				time.Sleep(args.Interval)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(chDone)
+			cancel()
+		})
+	}
+}
+
+type HeadTrackableFunc func(context.Context, models.Head)
+
+func (HeadTrackableFunc) Connect(*models.Head) error { return nil }
+func (HeadTrackableFunc) Disconnect()                {}
+func (fn HeadTrackableFunc) OnNewLongestChain(ctx context.Context, head models.Head) {
+	fn(ctx, head)
+}
+
+type testifyExpectationsAsserter interface {
+	AssertExpectations(t mock.TestingT) bool
+}
+
+type fakeT struct{}
+
+func (ft fakeT) Logf(format string, args ...interface{})   {}
+func (ft fakeT) Errorf(format string, args ...interface{}) {}
+func (ft fakeT) FailNow()                                  {}
+
+func EventuallyExpectationsMet(t *testing.T, mock testifyExpectationsAsserter, timeout time.Duration, interval time.Duration) {
+	t.Helper()
+
+	chTimeout := time.After(timeout)
+	for {
+		var ft fakeT
+		success := mock.AssertExpectations(ft)
+		if success {
+			return
+		}
+		select {
+		case <-chTimeout:
+			mock.AssertExpectations(t)
+			t.FailNow()
+		default:
+			time.Sleep(interval)
+		}
+	}
+}
+
+func AssertCount(t *testing.T, store *strpkg.Store, model interface{}, expected int64) {
+	t.Helper()
+	var count int64
+	err := store.DB.Model(model).Count(&count).Error
+	require.NoError(t, err)
+	require.Equal(t, expected, count)
+}
+
+func WaitForCount(t testing.TB, store *strpkg.Store, model interface{}, want int64) {
+	t.Helper()
+	g := gomega.NewGomegaWithT(t)
+	var count int64
+	var err error
+	g.Eventually(func() int64 {
+		err = store.DB.Model(model).Count(&count).Error
+		assert.NoError(t, err)
+		return count
+	}, DBWaitTimeout, DBPollingInterval).Should(gomega.Equal(want))
+}
+
+func AssertCountStays(t testing.TB, store *strpkg.Store, model interface{}, want int64) {
+	t.Helper()
+	g := gomega.NewGomegaWithT(t)
+	var count int64
+	var err error
+	g.Consistently(func() int64 {
+		err = store.DB.Model(model).Count(&count).Error
+		assert.NoError(t, err)
+		return count
+	}, AssertNoActionTimeout, DBPollingInterval).Should(gomega.Equal(want))
+}
+
+func AssertRecordEventually(t *testing.T, store *strpkg.Store, model interface{}, check func() bool) {
+	t.Helper()
+	g := gomega.NewGomegaWithT(t)
+	g.Eventually(func() bool {
+		err := store.DB.Find(model).Error
+		require.NoError(t, err, "unable to find record in DB")
+		return check()
+	}, DBWaitTimeout, DBPollingInterval).Should(gomega.BeTrue())
 }

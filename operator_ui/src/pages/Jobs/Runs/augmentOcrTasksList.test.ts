@@ -5,7 +5,7 @@ describe('augmentOcrTasksList', () => {
   it('adds error, output and status attributes', () => {
     const jobRun: PipelineJobRun = {
       pipelineSpec: {
-        DotDagSource:
+        dotDagSource:
           '    fetch   [type=http method=GET url="https://bitstamp.net/api/ticker/"];\n    parseLast    [type=jsonparse path="last"];\n    multiplyLast [type=multiply times=100];\n\n    fetch2    [type=http method=GET url="https://bitstamp.net/api/ticker/"];\n    parseOpen    [type=jsonparse path="open"];\n    multiplyOpen [type=multiply times=100];\n\n\n fetch -> parseLast  -> multiplyLast -> answer;\n fetch2 -> parseOpen  -> multiplyOpen -> answer;\n\nanswer [type=median                      index=0];\nanswer [type=median                      index=1];\n\n',
       },
       errors: [
@@ -20,9 +20,7 @@ describe('augmentOcrTasksList', () => {
           output: null,
           error:
             'majority of fetchers in median failed: error making http request: reason; error making http request: reason: bad input for task',
-          taskSpec: {
-            dotId: 'answer',
-          },
+          dotId: 'answer',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.19516Z',
           status: 'errored',
@@ -31,9 +29,7 @@ describe('augmentOcrTasksList', () => {
           type: 'multiply',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'multiplyLast',
-          },
+          dotId: 'multiplyLast',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.171678Z',
           status: 'not_run',
@@ -42,9 +38,7 @@ describe('augmentOcrTasksList', () => {
           type: 'multiply',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'multiplyOpen',
-          },
+          dotId: 'multiplyOpen',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.176633Z',
           status: 'not_run',
@@ -53,9 +47,7 @@ describe('augmentOcrTasksList', () => {
           type: 'jsonparse',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'parseLast',
-          },
+          dotId: 'parseLast',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.154488Z',
           status: 'not_run',
@@ -64,9 +56,7 @@ describe('augmentOcrTasksList', () => {
           type: 'jsonparse',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'parseOpen',
-          },
+          dotId: 'parseOpen',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.15558Z',
           status: 'not_run',
@@ -75,9 +65,7 @@ describe('augmentOcrTasksList', () => {
           type: 'http',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'fetch',
-          },
+          dotId: 'fetch',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.12949Z',
           status: 'errored',
@@ -86,9 +74,7 @@ describe('augmentOcrTasksList', () => {
           type: 'http',
           output: null,
           error: 'error making http request: reason',
-          taskSpec: {
-            dotId: 'fetch2',
-          },
+          dotId: 'fetch2',
           createdAt: '2020-11-24T11:38:36.100272Z',
           finishedAt: '2020-11-24T11:39:26.127941Z',
           status: 'errored',

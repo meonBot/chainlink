@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/jackc/pgconn"
+
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/services/chainlink"
@@ -87,15 +88,15 @@ func (jsc *JobSpecsController) Create(c *gin.Context) {
 		jsonAPIError(c, httpStatus, err)
 		return
 	}
-	if err := NotifyExternalInitiator(js, jsc.App.GetStore()); err != nil {
+	if err := jsc.App.GetExternalInitiatorManager().Notify(js, jsc.App.GetStore()); err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 	if err := jsc.App.AddJob(js); err != nil {
 		switch err := err.(type) {
-		case *pq.Error:
+		case *pgconn.PgError:
 			var apiErr error
-			if err.Constraint == "job_specs_name_key" {
+			if err.ConstraintName == "job_specs_name_key" {
 				apiErr = fmt.Errorf("name '%s' already taken", js.Name)
 			} else {
 				apiErr = err

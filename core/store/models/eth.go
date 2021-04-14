@@ -52,10 +52,12 @@ type EthTx struct {
 	Value          assets.Eth
 	GasLimit       uint64
 	Error          *string
-	BroadcastAt    *time.Time
-	CreatedAt      time.Time
-	State          EthTxState
-	EthTxAttempts  []EthTxAttempt `gorm:"association_autoupdate:false;association_autocreate:false"`
+	// BroadcastAt is updated every time an attempt for this eth_tx is re-sent
+	// In almost all cases it will be within a second or so of the actual send time.
+	BroadcastAt   *time.Time
+	CreatedAt     time.Time
+	State         EthTxState
+	EthTxAttempts []EthTxAttempt `gorm:"->"`
 }
 
 func (e EthTx) GetError() error {
@@ -80,7 +82,7 @@ type EthTxAttempt struct {
 	CreatedAt               time.Time
 	BroadcastBeforeBlockNum *int64
 	State                   EthTxAttemptState
-	EthReceipts             []EthReceipt `gorm:"foreignkey:TxHash;association_foreignkey:Hash;association_autoupdate:false;association_autocreate:false"`
+	EthReceipts             []EthReceipt `gorm:"foreignKey:TxHash;references:Hash;association_foreignkey:Hash;->"`
 }
 
 type EthReceipt struct {
@@ -110,7 +112,7 @@ type Head struct {
 	Hash       common.Hash
 	Number     int64
 	ParentHash common.Hash
-	Parent     *Head
+	Parent     *Head `gorm:"-"`
 	Timestamp  time.Time
 	CreatedAt  time.Time
 }
@@ -135,6 +137,21 @@ func (h Head) EarliestInChain() Head {
 		}
 	}
 	return h
+}
+
+// IsInChain returns true if the given hash matches the hash of a head in the chain
+func (h Head) IsInChain(blockHash common.Hash) bool {
+	for {
+		if h.Hash == blockHash {
+			return true
+		}
+		if h.Parent != nil {
+			h = *h.Parent
+		} else {
+			break
+		}
+	}
+	return false
 }
 
 // ChainLength returns the length of the chain followed by recursively looking up parents
@@ -359,4 +376,53 @@ func (ary UntrustedBytes) SafeByteSlice(start int, end int) ([]byte, error) {
 		return empty, errors.New("out of bounds slice access")
 	}
 	return ary[start:end], nil
+}
+
+type blockInternal struct {
+	Number       string
+	Hash         common.Hash
+	ParentHash   common.Hash
+	Transactions []types.Transaction
+}
+
+// Int64ToHex converts an int64 into go-ethereum's hex representation
+func Int64ToHex(n int64) string {
+	return hexutil.EncodeBig(big.NewInt(n))
+}
+
+// Block represents an ethereum block
+type Block struct {
+	Number       int64
+	Hash         common.Hash
+	ParentHash   common.Hash
+	Transactions []types.Transaction
+}
+
+// MarshalJSON implements json marshalling for Block
+func (b Block) MarshalJSON() ([]byte, error) {
+	return json.Marshal(blockInternal{
+		Int64ToHex(b.Number),
+		b.Hash,
+		b.ParentHash,
+		b.Transactions,
+	})
+}
+
+// UnmarshalJSON unmarshals to a Block
+func (b *Block) UnmarshalJSON(data []byte) error {
+	bi := blockInternal{}
+	if err := json.Unmarshal(data, &bi); err != nil {
+		return err
+	}
+	n, err := hexutil.DecodeBig(bi.Number)
+	if err != nil {
+		return err
+	}
+	*b = Block{
+		n.Int64(),
+		bi.Hash,
+		bi.ParentHash,
+		bi.Transactions,
+	}
+	return nil
 }

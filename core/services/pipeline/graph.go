@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"time"
+
 	"github.com/pkg/errors"
 	"gonum.org/v1/gonum/graph"
 	"gonum.org/v1/gonum/graph/encoding"
@@ -12,6 +14,7 @@ import (
 // TaskDAG fulfills the graph.DirectedGraph interface, which makes it possible
 // for us to `dot.Unmarshal(...)` a DOT string directly into it.  Once unmarshalled,
 // calling `TaskDAG#TasksInDependencyOrder()` will return the unmarshaled tasks.
+// NOTE: We only permit one child
 type TaskDAG struct {
 	*simple.DirectedGraph
 	DOTSource string
@@ -60,7 +63,8 @@ func (g TaskDAG) TasksInDependencyOrder() ([]Task, error) {
 			continue
 		}
 
-		task, err := UnmarshalTaskFromMap(TaskType(node.attrs["type"]), node.attrs, node.dotID, nil, nil)
+		nPreds := g.To(node.ID()).Len()
+		task, err := UnmarshalTaskFromMap(TaskType(node.attrs["type"]), node.attrs, node.dotID, nil, nil, nil, nPreds)
 		if err != nil {
 			return nil, err
 		}
@@ -86,6 +90,22 @@ func (g TaskDAG) TasksInDependencyOrder() ([]Task, error) {
 		visited[node.ID()] = true
 	}
 	return tasks, nil
+}
+
+func (g TaskDAG) MinTimeout() (time.Duration, bool, error) {
+	var minTimeout time.Duration = 1<<63 - 1
+	var aTimeoutSet bool
+	tasks, err := g.TasksInDependencyOrder()
+	if err != nil {
+		return minTimeout, aTimeoutSet, err
+	}
+	for _, t := range tasks {
+		if timeout, set := t.TaskTimeout(); set && timeout < minTimeout {
+			minTimeout = timeout
+			aTimeoutSet = true
+		}
+	}
+	return minTimeout, aTimeoutSet, nil
 }
 
 func (g TaskDAG) outputs() []*taskDAGNode {

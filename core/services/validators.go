@@ -8,24 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
 	"github.com/smartcontractkit/chainlink/core/utils"
-	ocr "github.com/smartcontractkit/libocr/offchainreporting"
-	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/jinzhu/gorm"
-	"github.com/multiformats/go-multiaddr"
-	"github.com/pelletier/go-toml"
-	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
-	"go.uber.org/multierr"
+	"gorm.io/gorm"
 )
 
 // ValidateJob checks the job and its associated Initiators and Tasks for any
@@ -251,18 +243,6 @@ func validateRunLogInitiator(i models.Initiator, j models.JobSpec, s *store.Stor
 					fe.Add("Cannot set EthTx Task's function selector parameter with a RunLog Initiator")
 				} else if key == "address" {
 					fe.Add("Cannot set EthTx Task's address parameter with a RunLog Initiator")
-				} else if key == "fromaddress" {
-					if !common.IsHexAddress(v.String()) {
-						fe.Add("Cannot set EthTx Task's fromAddress parameter: invalid address")
-						return true
-					}
-					address := common.HexToAddress(v.String())
-					exists, err := s.KeyExists(address)
-					if err != nil {
-						fe.Add("Cannot set EthTx Task's fromAddress parameter: " + err.Error())
-					} else if !exists {
-						fe.Add("Cannot set EthTx Task's fromAddress parameter: the node does not have this private key in the database")
-					}
 				}
 				return true
 			})
@@ -329,6 +309,39 @@ func validateTask(task models.TaskSpec, store *store.Store) error {
 			return errors.New("Sleep Adapter is not implemented yet")
 		}
 	}
+	switch adapter.TaskType() {
+	case adapters.TaskTypeEthTx:
+		return validateTaskTypeEthTx(task, store)
+	case adapters.TaskTypeRandom:
+		return validateTaskTypeRandom(task)
+	}
+	return nil
+}
+
+func validateTaskTypeEthTx(task models.TaskSpec, store *store.Store) error {
+	if task.Params.Get("fromAddress").Exists() {
+		fromAddress := task.Params.Get("fromAddress").String()
+		if !common.IsHexAddress(fromAddress) {
+			return errors.Errorf("cannot set EthTx Task's fromAddress parameter invalid address %v", fromAddress)
+		}
+		key, err := store.KeyByAddress(common.HexToAddress(fromAddress))
+		if err != nil {
+			return errors.Errorf("error %v finding key for address %s", err, fromAddress)
+		}
+		if key.IsFunding {
+			return errors.Errorf("address %s is a funding address, cannot use it to send transactions", fromAddress)
+		}
+	}
+	return nil
+}
+
+func validateTaskTypeRandom(task models.TaskSpec) error {
+	if task.MinRequiredIncomingConfirmations.Uint32 == 0 {
+		return errors.Errorf("confirmations is a required field for random tasks")
+	}
+	if !task.Params.Get("publicKey").Exists() {
+		return errors.Errorf("publicKey is a required field for random tasks")
+	}
 	return nil
 }
 
@@ -376,198 +389,4 @@ func ValidateServiceAgreement(sa models.ServiceAgreement, store *store.Store) er
 	}
 
 	return fe.CoerceEmptyToNil()
-}
-
-// ValidatedOracleSpecToml validates an oracle spec that came from TOML
-func ValidatedOracleSpecToml(config *orm.Config, tomlString string) (spec offchainreporting.OracleSpec, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.Errorf("panicked with err %v", r)
-		}
-	}()
-
-	var oros models.OffchainReportingOracleSpec
-	spec = offchainreporting.OracleSpec{
-		Pipeline: *pipeline.NewTaskDAG(),
-	}
-	tree, err := toml.Load(tomlString)
-	if err != nil {
-		return spec, err
-	}
-	// Note this validates all the fields which implement an UnmarshalText
-	// i.e. TransmitterAddress, PeerID...
-	err = tree.Unmarshal(&oros)
-	if err != nil {
-		return spec, err
-	}
-	err = tree.Unmarshal(&spec)
-	if err != nil {
-		return spec, err
-	}
-	spec.OffchainReportingOracleSpec = oros
-
-	// TODO(#175801426): upstream a way to check for undecoded keys in go-toml
-	// TODO(#175801038): upstream support for time.Duration defaults in go-toml
-	if spec.Type != "offchainreporting" {
-		return spec, errors.Errorf("the only supported type is currently 'offchainreporting', got %s", spec.Type)
-	}
-	if spec.SchemaVersion != uint32(1) {
-		return spec, errors.Errorf("the only supported schema version is currently 1, got %v", spec.SchemaVersion)
-	}
-	if !tree.Has("isBootstrapPeer") {
-		return spec, errors.New("isBootstrapPeer is not defined")
-	}
-	for i := range spec.P2PBootstrapPeers {
-		if _, err := multiaddr.NewMultiaddr(spec.P2PBootstrapPeers[i]); err != nil {
-			return spec, errors.Wrapf(err, "p2p bootstrap peer %v is invalid", spec.P2PBootstrapPeers[i])
-		}
-	}
-	if spec.IsBootstrapPeer {
-		if err := validateBootstrapSpec(tree, spec); err != nil {
-			return spec, err
-		}
-	} else if err := validateNonBootstrapSpec(tree, config, spec); err != nil {
-		return spec, err
-	}
-	if err := validateTimingParameters(config, spec); err != nil {
-		return spec, err
-	}
-	if err := validateMonitoringURL(spec); err != nil {
-		return spec, err
-	}
-	return spec, nil
-}
-
-// Parameters that must be explicitly set by the operator.
-var (
-	// Common to both bootstrap and non-boostrap
-	params = map[string]struct{}{
-		"type":            {},
-		"schemaVersion":   {},
-		"contractAddress": {},
-		"isBootstrapPeer": {},
-	}
-	// Boostrap and non-bootstrap parameters
-	// are mutually exclusive.
-	bootstrapParams    = map[string]struct{}{}
-	nonBootstrapParams = map[string]struct{}{
-		"observationSource": {},
-	}
-)
-
-func cloneSet(in map[string]struct{}) map[string]struct{} {
-	out := make(map[string]struct{})
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func validateTimingParameters(config *orm.Config, spec offchainreporting.OracleSpec) error {
-	return ocr.SanityCheckLocalConfig(ocrtypes.LocalConfig{
-		BlockchainTimeout:                      config.OCRBlockchainTimeout(time.Duration(spec.BlockchainTimeout)),
-		ContractConfigConfirmations:            config.OCRContractConfirmations(spec.ContractConfigConfirmations),
-		ContractConfigTrackerPollInterval:      config.OCRContractPollInterval(time.Duration(spec.ContractConfigTrackerPollInterval)),
-		ContractConfigTrackerSubscribeInterval: config.OCRContractSubscribeInterval(time.Duration(spec.ContractConfigTrackerSubscribeInterval)),
-		ContractTransmitterTransmitTimeout:     config.OCRContractTransmitterTransmitTimeout(),
-		DatabaseTimeout:                        config.OCRDatabaseTimeout(),
-		DataSourceTimeout:                      config.OCRObservationTimeout(time.Duration(spec.ObservationTimeout)),
-	})
-}
-
-func validateBootstrapSpec(tree *toml.Tree, spec offchainreporting.OracleSpec) error {
-	expected, notExpected := cloneSet(params), cloneSet(nonBootstrapParams)
-	for k := range bootstrapParams {
-		expected[k] = struct{}{}
-	}
-	if err := validateExplicitlySetKeys(tree, expected, notExpected, "bootstrap"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func validateNonBootstrapSpec(tree *toml.Tree, config *orm.Config, spec offchainreporting.OracleSpec) error {
-	expected, notExpected := cloneSet(params), cloneSet(bootstrapParams)
-	for k := range nonBootstrapParams {
-		expected[k] = struct{}{}
-	}
-	if err := validateExplicitlySetKeys(tree, expected, notExpected, "non-bootstrap"); err != nil {
-		return err
-	}
-	if spec.Pipeline.DOTSource == "" {
-		return errors.New("no pipeline specified")
-	}
-	observationTimeout := config.OCRObservationTimeout(time.Duration(spec.ObservationTimeout))
-	if time.Duration(spec.MaxTaskDuration) > observationTimeout {
-		return errors.Errorf("max task duration must be < observation timeout")
-	}
-	tasks, err := spec.Pipeline.TasksInDependencyOrder()
-	if err != nil {
-		return errors.Wrap(err, "invalid observation source")
-	}
-	for _, task := range tasks {
-		timeout, set := task.TaskTimeout()
-		if set && timeout > observationTimeout {
-			return errors.Errorf("individual max task duration must be < observation timeout")
-		}
-	}
-	return nil
-}
-
-func validateExplicitlySetKeys(tree *toml.Tree, expected map[string]struct{}, notExpected map[string]struct{}, peerType string) error {
-	var err error
-	// top level keys only
-	for _, k := range tree.Keys() {
-		// TODO(#175801577): upstream a way to check for children in go-toml
-		if _, ok := notExpected[k]; ok {
-			err = multierr.Append(err, errors.Errorf("unrecognised key for %s peer: %s", peerType, k))
-		}
-		delete(expected, k)
-	}
-	for missing := range expected {
-		err = multierr.Append(err, errors.Errorf("missing required key %s", missing))
-	}
-	return err
-}
-
-func validateMonitoringURL(spec offchainreporting.OracleSpec) error {
-	if spec.MonitoringEndpoint == "" {
-		return nil
-	}
-	_, err := url.Parse(spec.MonitoringEndpoint)
-	return err
-}
-
-func ValidatedEthRequestEventSpec(tomlString string) (spec EthRequestEventSpec, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.Errorf("panicked with err %v", r)
-		}
-	}()
-
-	var eres models.EthRequestEventSpec
-	spec = EthRequestEventSpec{
-		Pipeline: *pipeline.NewTaskDAG(),
-	}
-	tree, err := toml.Load(tomlString)
-	if err != nil {
-		return spec, err
-	}
-	err = tree.Unmarshal(&eres)
-	if err != nil {
-		return spec, err
-	}
-	err = tree.Unmarshal(&spec)
-	if err != nil {
-		return spec, err
-	}
-	spec.EthRequestEventSpec = eres
-
-	if spec.Type != "ethrequestevent" {
-		return spec, errors.Errorf("unsupported type %s", spec.Type)
-	}
-	if spec.SchemaVersion != uint32(1) {
-		return spec, errors.Errorf("the only supported schema version is currently 1, got %v", spec.SchemaVersion)
-	}
-	return spec, nil
 }

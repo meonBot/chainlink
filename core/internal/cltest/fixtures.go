@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/smartcontractkit/chainlink/core/services/job"
+
 	"github.com/smartcontractkit/chainlink/core/store/models"
 
 	"github.com/ethereum/go-ethereum/core/types"
@@ -21,6 +23,15 @@ func MustHelloWorldAgreement(t *testing.T) string {
 // FixtureCreateJobViaWeb creates a job from a fixture using /v2/specs
 func FixtureCreateJobViaWeb(t *testing.T, app *TestApplication, path string) models.JobSpec {
 	return CreateSpecViaWeb(t, app, string(MustReadFile(t, path)))
+}
+
+func FixtureCreateJobSpecV2ViaWeb(t *testing.T, app *TestApplication, path string) job.Job {
+	request := models.CreateJobSpecRequest{
+		TOML: string(MustReadFile(t, path)),
+	}
+	output, err := json.Marshal(request)
+	require.NoError(t, err)
+	return CreateJobViaWeb(t, app, output)
 }
 
 // JSONFromFixture create models.JSON from file path

@@ -6,11 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manyminds/api2go/jsonapi"
-
-	"github.com/smartcontractkit/chainlink/core/store/orm"
-
-	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
+	"github.com/tidwall/gjson"
 
 	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/assets"
@@ -25,6 +21,21 @@ import (
 
 func TestValidateJob(t *testing.T) {
 	t.Parallel()
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	// Create a funding key.
+	require.NoError(t, store.KeyStore.Unlock(cltest.Password))
+	funding, err := store.KeyStore.NewAccount()
+	require.NoError(t, err)
+	fundingKey := models.Key{
+		Address:   models.EIP55Address(funding.Address.Hex()),
+		IsFunding: true,
+		JSON: models.JSON{
+			Result: gjson.ParseBytes([]byte(`{"json" : true}`)),
+		},
+	}
+	require.NoError(t, store.CreateKeyIfNotExists(fundingKey))
 	tests := []struct {
 		name  string
 		input []byte
@@ -74,17 +85,19 @@ func TestValidateJob(t *testing.T) {
 		{
 			"runlog and ethtx with a fromAddress that doesn't match one of our keys",
 			cltest.MustReadFile(t, "testdata/runlog_ethtx_w_missing_fromAddress_job.json"),
-			models.NewJSONAPIErrorsWith("Cannot set EthTx Task's fromAddress parameter: the node does not have this private key in the database"),
+			models.NewJSONAPIErrorsWith("error record not found finding key for address 0x0f416a5a298f05d386cfe8164f342bec5b5e10d7"),
 		},
 		{
 			"runlog with two ethtx tasks",
 			cltest.MustReadFile(t, "testdata/runlog_2_ethlogs_job.json"),
 			models.NewJSONAPIErrorsWith("Cannot RunLog initiated jobs cannot have more than one EthTx Task"),
 		},
+		{
+			"cannot use funding key",
+			[]byte(fmt.Sprintf(string(cltest.MustReadFile(t, "testdata/runlog_ethtx_template_fromAddress_job.json")), fundingKey.Address.String())),
+			models.NewJSONAPIErrorsWith(fmt.Sprintf("address %v is a funding address, cannot use it to send transactions", fundingKey.Address.String())),
+		},
 	}
-
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -340,11 +353,11 @@ func TestValidateServiceAgreement(t *testing.T) {
 		{"more than one initiator should fail",
 			cltest.MustJSONSet(t, basic, "initiators",
 				[]models.Initiator{{
-					JobSpecID:       models.NewID(),
+					JobSpecID:       models.NewJobID(),
 					Type:            models.InitiatorServiceAgreementExecutionLog,
 					InitiatorParams: models.InitiatorParams{},
 				}, {
-					JobSpecID:       models.NewID(),
+					JobSpecID:       models.NewJobID(),
 					Type:            models.InitiatorWeb,
 					InitiatorParams: models.InitiatorParams{},
 				},
@@ -489,320 +502,60 @@ func TestValidateInitiator_FeedsErrors(t *testing.T) {
 	}
 }
 
-func TestValidateOracleSpec(t *testing.T) {
-	var tt = []struct {
-		name       string
-		toml       string
-		setGlobals func(t *testing.T, c *orm.Config)
-		assertion  func(t *testing.T, os offchainreporting.OracleSpec, err error)
-	}{
-		{
-			name: "minimal non-bootstrap oracle spec",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-isBootstrapPeer    = false
-observationSource = """
-ds1          [type=bridge name=voter_turnout];
-ds1_parse    [type=jsonparse path="one,two"];
-ds1_multiply [type=multiply times=1.23];
-ds1 -> ds1_parse -> ds1_multiply -> answer1;
-answer1      [type=median index=0];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.NoError(t, err)
-				// Should be able to jsonapi marshal/unmarshal the minimum spec.
-				// This ensures the UnmarshalJSON's defined on the fields handle a min spec correctly.
-				b, err := jsonapi.Marshal(os.OffchainReportingOracleSpec)
-				require.NoError(t, err)
-				var r models.OffchainReportingOracleSpec
-				err = jsonapi.Unmarshal(b, &r)
-				require.NoError(t, err)
-			},
-		},
-		{
-			name: "decodes valid oracle spec toml",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = [
-"/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = false
-keyBundleID        = "73e8966a78ca09bb912e9565cfb79fbe8a6048fab1f0cf49b18047c3895e0447"
-monitoringEndpoint = "chain.link:4321"
-transmitterAddress = "0xaA07d525B4006a2f927D79CA78a23A8ee680A32A"
-observationTimeout = "10s"
-observationSource = """
-ds1          [type=bridge name=voter_turnout];
-ds1_parse    [type=jsonparse path="one,two"];
-ds1_multiply [type=multiply times=1.23];
-ds1 -> ds1_parse -> ds1_multiply -> answer1;
-answer1      [type=median index=0];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.NoError(t, err)
-				assert.Equal(t, 1, int(os.SchemaVersion))
-				assert.False(t, os.IsBootstrapPeer)
-			},
-		},
-		{
-			name: "decodes bootstrap toml",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = []
-isBootstrapPeer    = true
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.NoError(t, err)
-				assert.Equal(t, 1, int(os.SchemaVersion))
-				assert.True(t, os.IsBootstrapPeer)
-			},
-		},
-		{
-			name: "raises error on extra keys",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = [
-"/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = true
-keyBundleID        = "73e8966a78ca09bb912e9565cfb79fbe8a6048fab1f0cf49b18047c3895e0447"
-monitoringEndpoint = "chain.link:4321"
-transmitterAddress = "0xaA07d525B4006a2f927D79CA78a23A8ee680A32A"
-observationTimeout = "10s"
-observationSource = """
-ds1          [type=bridge name=voter_turnout];
-ds1_parse    [type=jsonparse path="one,two"];
-ds1_multiply [type=multiply times=1.23];
-ds1 -> ds1_parse -> ds1_multiply -> answer1;
-answer1      [type=median index=0];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "unrecognised key for bootstrap peer: observationSource")
-			},
-		},
-		{
-			name: "empty pipeline string non-bootstrap node",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = []
-isBootstrapPeer    = false
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "invalid dot",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = []
-isBootstrapPeer    = false
-observationSource = """
-->
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "invalid peer address",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = ["/invalid/peer/address"]
-isBootstrapPeer    = false
-observationSource = """
-blah
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "non-zero timeouts",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = ["/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju"]
-isBootstrapPeer    = false
-blockchainTimeout  = "0s"
-observationSource = """
-blah
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "non-zero intervals",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = ["/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju"]
-isBootstrapPeer    = false
-contractConfigTrackerSubscribeInterval = "0s"
-observationSource = """
-blah
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "broken monitoring endpoint",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = []
-isBootstrapPeer    = true
-monitoringEndpoint = "\t/fd\2ff )(*&^%$#@"
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.EqualError(t, err, "(8, 23): invalid escape sequence: \\2")
-			},
-		},
-		{
-			name: "max task duration > observation timeout should error",
-			toml: `
-type               = "offchainreporting"
-maxTaskDuration    = "30s"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = [
-"/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = false
-keyBundleID        = "73e8966a78ca09bb912e9565cfb79fbe8a6048fab1f0cf49b18047c3895e0447"
-monitoringEndpoint = "chain.link:4321"
-transmitterAddress = "0xaA07d525B4006a2f927D79CA78a23A8ee680A32A"
-observationTimeout = "10s"
-observationSource = """
-ds1          [type=bridge name=voter_turnout];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), "max task duration must be < observation timeout")
-			},
-		},
-		{
-			name: "invalid peer ID",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID = "blah"
-isBootstrapPeer    = true
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), "failed to parse peer ID")
-			},
-		},
-		{
-			name: "individual max task duration > observation timeout should error",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = [
-"/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = false
-keyBundleID        = "73e8966a78ca09bb912e9565cfb79fbe8a6048fab1f0cf49b18047c3895e0447"
-monitoringEndpoint = "chain.link:4321"
-transmitterAddress = "0xaA07d525B4006a2f927D79CA78a23A8ee680A32A"
-observationTimeout = "10s"
-observationSource = """
-ds1          [type=bridge name=voter_turnout timeout="30s"];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), "individual max task duration must be < observation timeout")
-			},
-		},
-		{
-			name: "toml parse doesn't panic",
-			toml: string(cltest.MustHexDecodeString("2222220d5c22223b22225c0d21222222")),
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-		},
-		{
-			name: "invalid global default",
-			toml: `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "0x613a38AC1659769640aaE063C651F48E0250454C"
-p2pPeerID          = "12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq"
-p2pBootstrapPeers  = [
-"/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = false
-keyBundleID        = "73e8966a78ca09bb912e9565cfb79fbe8a6048fab1f0cf49b18047c3895e0447"
-monitoringEndpoint = "chain.link:4321"
-transmitterAddress = "0xaA07d525B4006a2f927D79CA78a23A8ee680A32A"
-observationSource = """
-ds1          [type=bridge name=voter_turnout];
-ds1_parse    [type=jsonparse path="one,two"];
-ds1_multiply [type=multiply times=1.23];
-ds1 -> ds1_parse -> ds1_multiply -> answer1;
-answer1      [type=median index=0];
-"""
-`,
-			assertion: func(t *testing.T, os offchainreporting.OracleSpec, err error) {
-				require.Error(t, err)
-			},
-			setGlobals: func(t *testing.T, c *orm.Config) {
-				c.Set("OCR_OBSERVATION_TIMEOUT", "20m")
-			},
-		},
+func TestValidateJob_VRF_Happy(t *testing.T) {
+	t.Parallel()
+
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	input := cltest.MustReadFile(t, "testdata/randomness_job.json")
+
+	var j models.JobSpec
+	assert.NoError(t, json.Unmarshal(input, &j))
+	err := services.ValidateJob(j, store)
+	assert.NoError(t, err)
+}
+
+func TestValidateJob_VRF_Error(t *testing.T) {
+	t.Parallel()
+
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	input := cltest.MustReadFile(t, "testdata/randomness_job.json")
+
+	makeVRFJob := func() models.JobSpec {
+		var job models.JobSpec
+		assert.NoError(t, json.Unmarshal(input, &job))
+		return job
 	}
 
-	for _, tc := range tt {
-		t.Run(tc.name, func(t *testing.T) {
-			c := orm.NewConfig()
-			if tc.setGlobals != nil {
-				tc.setGlobals(t, c)
-			}
-			s, err := services.ValidatedOracleSpecToml(c, tc.toml)
-			tc.assertion(t, s, err)
+	missingPubKeyJson := models.JSON{
+		Result: gjson.ParseBytes([]byte(`{}`)),
+	}
+
+	job1 := makeVRFJob()
+	job2 := makeVRFJob()
+	job3 := makeVRFJob()
+	job4 := makeVRFJob()
+
+	job1.Tasks[0].Params = missingPubKeyJson
+	job2.Tasks[0].MinRequiredIncomingConfirmations.Uint32 = 0
+	job3.Initiators[0].Address = utils.ZeroAddress
+	job4.Initiators = append(job2.Initiators, models.Initiator{Type: models.InitiatorWeb})
+
+	for _, test := range []struct {
+		name string
+		job  models.JobSpec
+	}{
+		{"mising public key", job1},
+		{"mising min confirmations", job2},
+		{"mising contract address", job3},
+		{"single initiator", job4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := services.ValidateJob(test.job, store)
+			assert.Error(t, err)
 		})
 	}
 }

@@ -1,4 +1,4 @@
-import { ApiResponse } from '@chainlink/json-api-client'
+import { ApiResponse } from 'utils/json-api-client'
 import { JobRun } from 'core/store/models'
 import jsonApiJobSpecRun from 'factories/jsonApiJobSpecRun'
 import { jsonApiOcrJobRun } from 'factories/jsonApiOcrJobRun'
@@ -22,7 +22,7 @@ describe('transformPipelineJobRun', () => {
       outputs: [null],
       pipelineSpec: {
         CreatedAt: '2020-11-19T14:01:24.989522Z',
-        DotDagSource: `   fetch    [type=http method=POST url="http://localhost:8001" requestData="{\\"hi\\": \\"hello\\"}"];
+        dotDagSource: `   fetch    [type=http method=POST url="http://localhost:8001" requestData="{\\"hi\\": \\"hello\\"}"];
     parse    [type=jsonparse path="data,result"];
     multiply [type=multiply times=100];
     fetch -> parse -> multiply;
@@ -38,9 +38,7 @@ describe('transformPipelineJobRun', () => {
           finishedAt: '2020-11-19T14:01:25.015681Z',
           output: null,
           status: 'not_run',
-          taskSpec: {
-            dotId: 'multiply',
-          },
+          dotId: 'multiply',
           type: 'multiply',
         },
         {
@@ -50,9 +48,7 @@ describe('transformPipelineJobRun', () => {
           finishedAt: '2020-11-19T14:01:25.005568Z',
           output: null,
           status: 'not_run',
-          taskSpec: {
-            dotId: 'parse',
-          },
+          dotId: 'parse',
           type: 'jsonparse',
         },
         {
@@ -62,9 +58,7 @@ describe('transformPipelineJobRun', () => {
           finishedAt: '2020-11-19T14:01:24.997068Z',
           output: null,
           status: 'errored',
-          taskSpec: {
-            dotId: 'fetch',
-          },
+          dotId: 'fetch',
           type: 'http',
         },
       ],

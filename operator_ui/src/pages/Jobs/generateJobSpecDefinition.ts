@@ -1,5 +1,12 @@
-import { ApiResponse } from '@chainlink/json-api-client'
-import { JobSpec, OcrJobSpec } from 'core/store/models'
+import { ApiResponse } from 'utils/json-api-client'
+import {
+  DirectRequestJobV2Spec,
+  FluxMonitorJobV2Spec,
+  JobSpec,
+  JobSpecV2,
+  OffChainReportingOracleJobV2Spec,
+  KeeperV2Spec,
+} from 'core/store/models'
 import { stringifyJobSpec, JobSpecFormats } from './utils'
 
 type DIRECT_REQUEST_DEFINITION_VALID_KEYS =
@@ -90,20 +97,131 @@ export const generateJSONDefinition = (
 }
 
 export const generateTOMLDefinition = (
-  jobSpecAttributes: ApiResponse<OcrJobSpec>['data']['attributes'],
+  jobSpecAttributes: ApiResponse<JobSpecV2>['data']['attributes'],
 ): string => {
+  if (jobSpecAttributes.type === 'directrequest') {
+    return generateDirectRequestDefinition(jobSpecAttributes)
+  }
+
+  if (jobSpecAttributes.type === 'fluxmonitor') {
+    return generateFluxMonitorDefinition(jobSpecAttributes)
+  }
+
+  if (jobSpecAttributes.type === 'offchainreporting') {
+    return generateOCRDefinition(jobSpecAttributes)
+  }
+
+  if (jobSpecAttributes.type === 'keeper') {
+    return generateKeeperDefinition(jobSpecAttributes)
+  }
+
+  return ''
+}
+
+function generateOCRDefinition(
+  attrs: ApiResponse<OffChainReportingOracleJobV2Spec>['data']['attributes'],
+) {
   const ocrSpecWithoutDates = {
-    ...jobSpecAttributes.offChainReportingOracleSpec,
+    ...attrs.offChainReportingOracleSpec,
     createdAt: undefined,
     updatedAt: undefined,
   }
 
   return stringifyJobSpec({
     value: {
-      type: 'offchainreporting',
-      schemaVersion: 1,
+      type: attrs.type,
+      schemaVersion: attrs.schemaVersion,
       ...ocrSpecWithoutDates,
-      observationSource: jobSpecAttributes.pipelineSpec.dotDagSource,
+      observationSource: attrs.pipelineSpec.dotDagSource,
+      maxTaskDuration: attrs.maxTaskDuration,
+    },
+    format: JobSpecFormats.TOML,
+  })
+}
+
+function generateFluxMonitorDefinition(
+  attrs: ApiResponse<FluxMonitorJobV2Spec>['data']['attributes'],
+) {
+  const {
+    fluxMonitorSpec,
+    name,
+    pipelineSpec,
+    schemaVersion,
+    type,
+    maxTaskDuration,
+  } = attrs
+  const {
+    contractAddress,
+    precision,
+    threshold,
+    absoluteThreshold,
+    idleTimerPeriod,
+    idleTimerDisabled,
+    pollTimerPeriod,
+    pollTimerDisabled,
+    minPayment,
+  } = fluxMonitorSpec
+
+  return stringifyJobSpec({
+    value: {
+      type,
+      schemaVersion,
+      name,
+      contractAddress,
+      precision,
+      threshold,
+      absoluteThreshold,
+      idleTimerPeriod,
+      idleTimerDisabled,
+      pollTimerPeriod,
+      pollTimerDisabled,
+      maxTaskDuration,
+      minPayment,
+      observationSource: pipelineSpec.dotDagSource,
+    },
+    format: JobSpecFormats.TOML,
+  })
+}
+
+function generateDirectRequestDefinition(
+  attrs: ApiResponse<DirectRequestJobV2Spec>['data']['attributes'],
+) {
+  const {
+    directRequestSpec,
+    name,
+    pipelineSpec,
+    schemaVersion,
+    type,
+    maxTaskDuration,
+  } = attrs
+  const { contractAddress } = directRequestSpec
+
+  return stringifyJobSpec({
+    value: {
+      type,
+      schemaVersion,
+      name,
+      contractAddress,
+      maxTaskDuration,
+      observationSource: pipelineSpec.dotDagSource,
+    },
+    format: JobSpecFormats.TOML,
+  })
+}
+
+function generateKeeperDefinition(
+  attrs: ApiResponse<KeeperV2Spec>['data']['attributes'],
+) {
+  const { keeperSpec, name, schemaVersion, type } = attrs
+  const { contractAddress, fromAddress } = keeperSpec
+
+  return stringifyJobSpec({
+    value: {
+      type,
+      schemaVersion,
+      name,
+      contractAddress,
+      fromAddress,
     },
     format: JobSpecFormats.TOML,
   })

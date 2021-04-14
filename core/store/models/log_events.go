@@ -85,9 +85,9 @@ func initiationRequiresJobSpecID(initiatorType string) bool {
 	return ok
 }
 
-// jobSpecIDTopics lists the ways jsID could be represented as a log topic. This
+// JobSpecIDTopics lists the ways jsID could be represented as a log topic. This
 // allows log subscriptions to respond to all possible representations.
-func JobSpecIDTopics(jsID *ID) []common.Hash {
+func JobSpecIDTopics(jsID JobID) []common.Hash {
 	return []common.Hash{
 		// The job to be initiated can be encoded in a log topic in two ways:
 		IDToTopic(jsID),    // 16 full-range bytes, left padded to 32 bytes,
@@ -120,9 +120,15 @@ func FilterQueryFactory(i Initiator, from *big.Int, addresses ...common.Address)
 		q.Topics = make([][]common.Hash, len(i.Topics))
 		copy(q.Topics, i.Topics)
 	case initiationRequiresJobSpecID(i.Type):
+		jobIDFilters := JobSpecIDTopics(i.JobSpecID)
+
+		if !utils.IsEmpty(i.InitiatorParams.JobIDTopicFilter.UUID().Bytes()) {
+			jobIDFilters = append(jobIDFilters, JobSpecIDTopics(i.InitiatorParams.JobIDTopicFilter)...)
+		}
+
 		q.Topics = [][]common.Hash{
 			TopicsForInitiatorsWhichRequireJobSpecIDTopic[i.Type],
-			JobSpecIDTopics(i.JobSpecID),
+			jobIDFilters,
 		}
 	default:
 		return ethereum.FilterQuery{},
@@ -136,7 +142,7 @@ func FilterQueryFactory(i Initiator, from *big.Int, addresses ...common.Address)
 // i.e. EthLogEvent, RunLogEvent, OracleLogEvent
 type LogRequest interface {
 	GetLog() Log
-	GetJobSpecID() *ID
+	GetJobSpecID() JobID
 	GetInitiator() Initiator
 
 	Validate() bool
@@ -178,7 +184,7 @@ func (le InitiatorLogEvent) GetLog() Log {
 }
 
 // GetJobSpecID returns the associated JobSpecID
-func (le InitiatorLogEvent) GetJobSpecID() *ID {
+func (le InitiatorLogEvent) GetJobSpecID() JobID {
 	return le.Initiator.JobSpecID
 }
 
@@ -192,7 +198,12 @@ func (le InitiatorLogEvent) GetInitiator() Initiator {
 func (le InitiatorLogEvent) ForLogger(kvs ...interface{}) []interface{} {
 	output := []interface{}{
 		"job", le.Initiator.JobSpecID.String(),
-		"log", le.Log.BlockNumber,
+		"blockNum", le.Log.BlockNumber,
+		"blockHash", le.Log.BlockHash.Hex(),
+		"txHash", le.Log.TxHash.Hex(),
+		"txIndex", le.Log.TxIndex,
+		"logIndex", le.Log.Index,
+		"removed", le.Log.Removed,
 		"initiator", le.Initiator,
 	}
 	for index, topic := range le.Log.Topics {
@@ -467,14 +478,14 @@ func bytesToHex(data []byte) string {
 	return utils.AddHexPrefix(hex.EncodeToString(data))
 }
 
-// IDToTopic encodes the bytes representation of the ID padded to fit into a
+// IDToTopic encodes the bytes representation of the JobID padded to fit into a
 // bytes32
-func IDToTopic(id *ID) common.Hash {
-	return common.BytesToHash(common.RightPadBytes(id.Bytes(), utils.EVMWordByteLen))
+func IDToTopic(id JobID) common.Hash {
+	return common.BytesToHash(common.RightPadBytes(id.UUID().Bytes(), utils.EVMWordByteLen))
 }
 
-// IDToHexTopic encodes the string representation of the ID
-func IDToHexTopic(id *ID) common.Hash {
+// IDToHexTopic encodes the string representation of the JobID
+func IDToHexTopic(id JobID) common.Hash {
 	return common.BytesToHash([]byte(id.String()))
 }
 

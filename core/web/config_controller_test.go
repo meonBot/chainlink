@@ -36,7 +36,6 @@ func TestConfigController_Show(t *testing.T) {
 	cp := presenters.ConfigPrinter{}
 	require.NoError(t, cltest.ParseJSONAPIResponse(t, resp, &cp))
 
-	assert.Equal(t, orm.LogLevel{Level: 0}, cp.LogLevel)
 	assert.Contains(t, cp.RootDir, "/tmp/chainlink_test/")
 	assert.Equal(t, uint16(6688), cp.Port)
 	assert.Equal(t, uint16(6689), cp.TLSPort)
@@ -54,5 +53,5 @@ func TestConfigController_Show(t *testing.T) {
 	assert.Equal(t, orm.NewConfig().BlockBackfillDepth(), cp.BlockBackfillDepth)
 	assert.Equal(t, assets.NewLink(100), cp.MinimumContractPayment)
 	assert.Equal(t, common.Address{}, cp.OperatorContractAddress)
-	assert.Equal(t, time.Millisecond*500, cp.DatabaseTimeout.Duration())
+	assert.Equal(t, time.Second*5, cp.DatabaseTimeout.Duration())
 }

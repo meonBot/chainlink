@@ -9,6 +9,7 @@ import (
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/models/ocrkey"
 	"github.com/smartcontractkit/chainlink/core/store/models/p2pkey"
@@ -16,11 +17,12 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/smartcontractkit/chainlink/core/web"
+	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 )
 
 // Renderer implements the Render method.
 type Renderer interface {
-	Render(interface{}) error
+	Render(interface{}, ...string) error
 }
 
 // RendererJSON is used to render JSON data.
@@ -29,11 +31,14 @@ type RendererJSON struct {
 }
 
 // Render writes the given input as a JSON string.
-func (rj RendererJSON) Render(v interface{}) error {
+func (rj RendererJSON) Render(v interface{}, _ ...string) error {
 	b, err := utils.FormatJSON(v)
 	if err != nil {
 		return err
 	}
+
+	// Append a new line
+	b = append(b, []byte("\n")...)
 	if _, err = rj.Write(b); err != nil {
 		return err
 	}
@@ -47,7 +52,11 @@ type RendererTable struct {
 
 // Render returns a formatted table of text for a given Job or presenter
 // and relevant information.
-func (rt RendererTable) Render(v interface{}) error {
+func (rt RendererTable) Render(v interface{}, headers ...string) error {
+	for _, h := range headers {
+		fmt.Println(h)
+	}
+
 	switch typed := v.(type) {
 	case *[]models.JobSpec:
 		return rt.renderJobs(*typed)
@@ -65,9 +74,9 @@ func (rt RendererTable) Render(v interface{}) error {
 		return rt.renderBridges(*typed)
 	case *presenters.ServiceAgreement:
 		return rt.renderServiceAgreement(*typed)
-	case *[]presenters.EthTx:
+	case *[]webpresenters.EthTxResource:
 		return rt.renderEthTxs(*typed)
-	case *presenters.EthTx:
+	case *webpresenters.EthTxResource:
 		return rt.renderEthTx(*typed)
 	case *presenters.ExternalInitiatorAuthentication:
 		return rt.renderExternalInitiatorAuthentication(*typed)
@@ -75,9 +84,9 @@ func (rt RendererTable) Render(v interface{}) error {
 		return rt.renderConfigPatchResponse(typed)
 	case *presenters.ConfigPrinter:
 		return rt.renderConfiguration(*typed)
-	case *presenters.ETHKey:
-		return rt.renderETHKeys([]presenters.ETHKey{*typed})
-	case *[]presenters.ETHKey:
+	case *webpresenters.ETHKeyResource:
+		return rt.renderETHKeys([]webpresenters.ETHKeyResource{*typed})
+	case *[]webpresenters.ETHKeyResource:
 		return rt.renderETHKeys(*typed)
 	case *p2pkey.EncryptedP2PKey:
 		return rt.renderP2PKeys([]p2pkey.EncryptedP2PKey{*typed})
@@ -87,9 +96,49 @@ func (rt RendererTable) Render(v interface{}) error {
 		return rt.renderOCRKeys([]ocrkey.EncryptedKeyBundle{*typed})
 	case *[]ocrkey.EncryptedKeyBundle:
 		return rt.renderOCRKeys(*typed)
+	case *[]Job:
+		return rt.renderJobsV2(*typed)
+	case *Job:
+		return rt.renderJobsV2([]Job{*typed})
+	case *pipeline.Run:
+		return rt.renderPipelineRun(*typed)
+	case *webpresenters.LogResource:
+		return rt.renderLogResource(*typed)
+	case *[]VRFKeyPresenter:
+		return rt.renderVRFKeys(*typed)
 	default:
 		return fmt.Errorf("unable to render object of type %T: %v", typed, typed)
 	}
+}
+
+func (rt RendererTable) renderVRFKeys(keys []VRFKeyPresenter) error {
+	var rows [][]string
+
+	for _, key := range keys {
+		rows = append(rows, []string{
+			key.Compressed,
+			key.Uncompressed,
+			key.Hash,
+			key.FriendlyCreatedAt(),
+			key.FriendlyUpdatedAt(),
+			key.FriendlyDeletedAt(),
+		})
+	}
+
+	renderList([]string{"Compressed", "Uncompressed", "Hash", "Created", "Updated", "Deleted"}, rows, rt.Writer)
+
+	return nil
+}
+
+func (rt RendererTable) renderLogResource(logResource webpresenters.LogResource) error {
+	table := rt.newTable([]string{"ID", "Level", "SqlEnabled"})
+	table.Append([]string{
+		logResource.ID,
+		logResource.Level,
+		strconv.FormatBool(logResource.SqlEnabled),
+	})
+	render("Logs", table)
+	return nil
 }
 
 func (rt RendererTable) renderJobs(jobs []models.JobSpec) error {
@@ -99,6 +148,19 @@ func (rt RendererTable) renderJobs(jobs []models.JobSpec) error {
 	}
 
 	render("Jobs", table)
+	return nil
+}
+
+func (rt RendererTable) renderJobsV2(jobs []Job) error {
+	table := rt.newTable([]string{"ID", "Name", "Type", "Tasks", "Created At"})
+	table.SetAutoMergeCells(true)
+	for _, j := range jobs {
+		for _, r := range j.ToRows() {
+			table.Append(r)
+		}
+	}
+
+	render("Jobs (V2)", table)
 	return nil
 }
 
@@ -149,7 +211,7 @@ func render(name string, table *tablewriter.Table) {
 	table.Render()
 }
 
-func renderList(fields []string, items [][]string) {
+func renderList(fields []string, items [][]string, writer io.Writer) {
 	var maxLabelLength int
 	for _, field := range fields {
 		if len(field) > maxLabelLength {
@@ -173,7 +235,11 @@ func renderList(fields []string, items [][]string) {
 	}
 	divider := strings.Repeat("-", maxLineLength)
 	listRendered := divider + "\n" + strings.Join(itemsRendered, "\n"+divider+"\n")
-	fmt.Println(listRendered)
+	_, err := writer.Write([]byte(listRendered))
+	if err != nil {
+		// Handles errcheck
+		return
+	}
 }
 
 func jobRowToStrings(job models.JobSpec) []string {
@@ -343,7 +409,7 @@ func (rt RendererTable) newTable(headers []string) *tablewriter.Table {
 	return table
 }
 
-func (rt RendererTable) renderEthTx(tx presenters.EthTx) error {
+func (rt RendererTable) renderEthTx(tx webpresenters.EthTxResource) error {
 	table := rt.newTable([]string{"From", "Nonce", "To", "State"})
 	table.Append([]string{
 		tx.From.Hex(),
@@ -356,7 +422,7 @@ func (rt RendererTable) renderEthTx(tx presenters.EthTx) error {
 	return nil
 }
 
-func (rt RendererTable) renderEthTxs(txs []presenters.EthTx) error {
+func (rt RendererTable) renderEthTxs(txs []webpresenters.EthTxResource) error {
 	table := rt.newTable([]string{"Hash", "Nonce", "From", "GasPrice", "SentAt", "State"})
 	for _, tx := range txs {
 		table.Append([]string{
@@ -384,21 +450,16 @@ func (rt RendererTable) renderConfigPatchResponse(config *web.ConfigPatchRespons
 	return nil
 }
 
-func (rt RendererTable) renderETHKeys(keys []presenters.ETHKey) error {
+func (rt RendererTable) renderETHKeys(keys []webpresenters.ETHKeyResource) error {
 	var rows [][]string
 	for _, key := range keys {
-		var nextNonce string
-		if key.NextNonce == nil {
-			nextNonce = "0"
-		} else {
-			nextNonce = fmt.Sprintf("%d", *key.NextNonce)
-		}
+		nextNonce := fmt.Sprintf("%d", key.NextNonce)
 		var lastUsed string
 		if key.LastUsed != nil {
 			lastUsed = key.LastUsed.String()
 		}
 		var deletedAt string
-		if !key.DeletedAt.IsZero() {
+		if key.DeletedAt.Valid {
 			deletedAt = key.DeletedAt.Time.String()
 		}
 		rows = append(rows, []string{
@@ -413,7 +474,8 @@ func (rt RendererTable) renderETHKeys(keys []presenters.ETHKey) error {
 			deletedAt,
 		})
 	}
-	renderList([]string{"Address", "ETH", "LINK", "Next nonce", "Last used", "Is funding", "Created", "Updated", "Deleted"}, rows)
+
+	renderList([]string{"Address", "ETH", "LINK", "Next nonce", "Last used", "Is funding", "Created", "Updated", "Deleted"}, rows, rt.Writer)
 	return nil
 }
 
@@ -421,7 +483,7 @@ func (rt RendererTable) renderP2PKeys(p2pKeys []p2pkey.EncryptedP2PKey) error {
 	var rows [][]string
 	for _, key := range p2pKeys {
 		var deletedAt string
-		if !key.DeletedAt.IsZero() {
+		if key.DeletedAt.Valid {
 			deletedAt = key.DeletedAt.Time.String()
 		}
 		rows = append(rows, []string{
@@ -434,7 +496,7 @@ func (rt RendererTable) renderP2PKeys(p2pKeys []p2pkey.EncryptedP2PKey) error {
 		})
 	}
 	fmt.Println("\n🔑 P2P Keys")
-	renderList([]string{"ID", "Peer ID", "Public key", "Created", "Updated", "Deleted"}, rows)
+	renderList([]string{"ID", "Peer ID", "Public key", "Created", "Updated", "Deleted"}, rows, rt.Writer)
 	return nil
 }
 
@@ -442,7 +504,7 @@ func (rt RendererTable) renderOCRKeys(ocrKeys []ocrkey.EncryptedKeyBundle) error
 	var rows [][]string
 	for _, key := range ocrKeys {
 		var deletedAt string
-		if !key.DeletedAt.IsZero() {
+		if key.DeletedAt.Valid {
 			deletedAt = key.DeletedAt.Time.String()
 		}
 		rows = append(rows, []string{
@@ -456,6 +518,25 @@ func (rt RendererTable) renderOCRKeys(ocrKeys []ocrkey.EncryptedKeyBundle) error
 		})
 	}
 	fmt.Println("\n🔑 OCR Keys")
-	renderList([]string{"ID", "On-chain signing addr", "Off-chain pubkey", "Config pubkey", "Created", "Updated", "Deleted"}, rows)
+	renderList([]string{"ID", "On-chain signing addr", "Off-chain pubkey", "Config pubkey", "Created", "Updated", "Deleted"}, rows, rt.Writer)
+	return nil
+}
+
+func (rt RendererTable) renderPipelineRun(run pipeline.Run) error {
+	table := rt.newTable([]string{"ID", "Created At", "Finished At"})
+
+	var finishedAt string
+	if run.FinishedAt != nil {
+		finishedAt = run.FinishedAt.String()
+	}
+
+	row := []string{
+		run.GetID(),
+		run.CreatedAt.String(),
+		finishedAt,
+	}
+	table.Append(row)
+
+	render("Pipeline Run", table)
 	return nil
 }

@@ -5,12 +5,12 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
+
 	"github.com/ethereum/go-ethereum/accounts/abi/bind/backends"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/eth"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,11 +24,11 @@ import (
 
 // NB: For changes to the VRF solidity code to be reflected here, "go generate"
 // must be run in core/services/vrf.
-func vrfVerifier() *solidity_vrf_verifier_wrapper.VRFTestHelper {
+func vrfVerifier(t *testing.T) *solidity_vrf_verifier_wrapper.VRFTestHelper {
 	ethereumKey, _ := crypto.GenerateKey()
-	auth := bind.NewKeyedTransactor(ethereumKey)
+	auth := cltest.MustNewSimulatedBackendKeyedTransactor(t, ethereumKey)
 	genesisData := core.GenesisAlloc{auth.From: {Balance: big.NewInt(1000000000)}}
-	gasLimit := eth.DefaultConfig.Miner.GasCeil
+	gasLimit := ethconfig.Defaults.Miner.GasCeil
 	backend := backends.NewSimulatedBackend(genesisData, gasLimit)
 	_, _, verifier, err := solidity_vrf_verifier_wrapper.DeployVRFTestHelper(auth, backend)
 	if err != nil {
@@ -89,7 +89,7 @@ func TestKeyStoreEndToEnd(t *testing.T) {
 	require.NoError(t, err, "should be able to get a specific key")
 	assert.True(t, bytes.Equal(encryptedKey.PublicKey[:], key[:]), "should have recovered the encrypted key for the requested public key")
 
-	verifier := vrfVerifier() // Generated proof is valid
+	verifier := vrfVerifier(t) // Generated proof is valid
 	coordinatorProof, err := vrf.UnmarshalProofResponse(proof)
 	require.NoError(t, err)
 

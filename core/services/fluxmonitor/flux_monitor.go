@@ -9,26 +9,33 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/smartcontractkit/chainlink/core/assets"
+	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
+	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flags_wrapper"
+	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/services/eth/contracts"
+	"github.com/smartcontractkit/chainlink/core/services/fluxmonitor/promfm"
+	"github.com/smartcontractkit/chainlink/core/services/log"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
 	"github.com/smartcontractkit/chainlink/core/utils"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/jinzhu/gorm"
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
 	"github.com/tevino/abool"
+	"gorm.io/gorm"
 )
 
 const hibernationPollPeriod = 24 * time.Hour
+
+var fluxAggregatorABI = eth.MustGetABI(flux_aggregator_wrapper.FluxAggregatorABI)
 
 //go:generate mockery --name Service --output ../../internal/mocks/ --case=underscore
 //go:generate mockery --name DeviationCheckerFactory --output ../../internal/mocks/ --case=underscore
@@ -36,7 +43,7 @@ const hibernationPollPeriod = 24 * time.Hour
 
 type RunManager interface {
 	Create(
-		jobSpecID *models.ID,
+		jobSpecID models.JobID,
 		initiator *models.Initiator,
 		creationHeight *big.Int,
 		runRequest *models.RunRequest,
@@ -47,7 +54,7 @@ type RunManager interface {
 // needed to listen to price deviations and new round requests.
 type Service interface {
 	AddJob(models.JobSpec) error
-	RemoveJob(*models.ID)
+	RemoveJob(models.JobID)
 	Start() error
 	Stop()
 }
@@ -55,10 +62,10 @@ type Service interface {
 type concreteFluxMonitor struct {
 	store          *store.Store
 	runManager     RunManager
-	logBroadcaster eth.LogBroadcaster
+	logBroadcaster log.Broadcaster
 	checkerFactory DeviationCheckerFactory
 	chAdd          chan addEntry
-	chRemove       chan models.ID
+	chRemove       chan models.JobID
 	chConnect      chan *models.Head
 	chDisconnect   chan struct{}
 	chStop         chan struct{}
@@ -67,7 +74,7 @@ type concreteFluxMonitor struct {
 }
 
 type addEntry struct {
-	jobID    models.ID
+	jobID    models.JobID
 	checkers []DeviationChecker
 }
 
@@ -76,7 +83,7 @@ type addEntry struct {
 func New(
 	store *store.Store,
 	runManager RunManager,
-	logBroadcaster eth.LogBroadcaster,
+	logBroadcaster log.Broadcaster,
 ) Service {
 	return &concreteFluxMonitor{
 		store:          store,
@@ -87,7 +94,7 @@ func New(
 			logBroadcaster: logBroadcaster,
 		},
 		chAdd:        make(chan addEntry),
-		chRemove:     make(chan models.ID),
+		chRemove:     make(chan models.JobID),
 		chConnect:    make(chan *models.Head),
 		chDisconnect: make(chan struct{}),
 		chStop:       make(chan struct{}),
@@ -140,7 +147,7 @@ func (fm *concreteFluxMonitor) Stop() {
 func (fm *concreteFluxMonitor) serveInternalRequests() {
 	defer close(fm.chDone)
 
-	jobMap := map[models.ID][]DeviationChecker{}
+	jobMap := map[models.JobID][]DeviationChecker{}
 
 	for {
 		select {
@@ -160,17 +167,29 @@ func (fm *concreteFluxMonitor) serveInternalRequests() {
 				logger.Debugf("job '%s' is missing from the flux monitor", jobID.String())
 				continue
 			}
+			waiter := sync.WaitGroup{}
+			waiter.Add(len(checkers))
 			for _, checker := range checkers {
-				checker.Stop()
+				go func(checker DeviationChecker) {
+					checker.Stop()
+					waiter.Done()
+				}(checker)
 			}
+			waiter.Wait()
 			delete(jobMap, jobID)
 
 		case <-fm.chStop:
+			waiter := sync.WaitGroup{}
 			for _, checkers := range jobMap {
+				waiter.Add(len(checkers))
 				for _, checker := range checkers {
-					checker.Stop()
+					go func(checker DeviationChecker) {
+						checker.Stop()
+						waiter.Done()
+					}(checker)
 				}
 			}
+			waiter.Wait()
 			return
 		}
 	}
@@ -179,8 +198,8 @@ func (fm *concreteFluxMonitor) serveInternalRequests() {
 // AddJob created a DeviationChecker for any job initiators of type
 // InitiatorFluxMonitor.
 func (fm *concreteFluxMonitor) AddJob(job models.JobSpec) error {
-	if job.ID == nil {
-		err := errors.New("received job with nil ID")
+	if job.ID.IsZero() {
+		err := errors.New("received job with zero ID")
 		logger.Error(err)
 		return err
 	}
@@ -210,18 +229,18 @@ func (fm *concreteFluxMonitor) AddJob(job models.JobSpec) error {
 		return nil
 	}
 
-	fm.chAdd <- addEntry{*job.ID, validCheckers}
+	fm.chAdd <- addEntry{job.ID, validCheckers}
 	return nil
 }
 
 // RemoveJob stops and removes the checker for all Flux Monitor initiators belonging
 // to the passed job ID.
-func (fm *concreteFluxMonitor) RemoveJob(id *models.ID) {
-	if id == nil {
+func (fm *concreteFluxMonitor) RemoveJob(id models.JobID) {
+	if id.IsZero() {
 		logger.Warn("nil job ID passed to FluxMonitor#RemoveJob")
 		return
 	}
-	fm.chRemove <- *id
+	fm.chRemove <- id
 }
 
 // DeviationCheckerFactory holds the New method needed to create a new instance
@@ -232,7 +251,7 @@ type DeviationCheckerFactory interface {
 
 type pollingDeviationCheckerFactory struct {
 	store          *store.Store
-	logBroadcaster eth.LogBroadcaster
+	logBroadcaster log.Broadcaster
 }
 
 func (f pollingDeviationCheckerFactory) New(
@@ -269,29 +288,41 @@ func (f pollingDeviationCheckerFactory) New(
 	}
 
 	f.logBroadcaster.AddDependents(1)
-	fluxAggregator, err := contracts.NewFluxAggregator(initr.Address, f.store.EthClient, f.logBroadcaster)
+	fluxAggregator, err := flux_aggregator_wrapper.NewFluxAggregator(initr.Address, f.store.EthClient)
 	if err != nil {
 		return nil, err
 	}
 
-	var flagsContract *contracts.Flags
+	var flagsContract *flags_wrapper.Flags
 	if f.store.Config.FlagsContractAddress() != "" {
 		flagsContractAddress := common.HexToAddress(f.store.Config.FlagsContractAddress())
-		flagsContract, err = contracts.NewFlagsContract(flagsContractAddress, f.store.EthClient)
+		flagsContract, err = flags_wrapper.NewFlags(flagsContractAddress, f.store.EthClient)
 		errorMsg := fmt.Sprintf("unable to create Flags contract instance, check address: %s", f.store.Config.FlagsContractAddress())
 		logger.ErrorIf(err, errorMsg)
+	}
+
+	min, err := fluxAggregator.MinSubmissionValue(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	max, err := fluxAggregator.MaxSubmissionValue(nil)
+	if err != nil {
+		return nil, err
 	}
 
 	return NewPollingDeviationChecker(
 		f.store,
 		fluxAggregator,
+		flagsContract,
 		f.logBroadcaster,
 		initr,
 		minJobPayment,
 		runManager,
 		fetcher,
-		flagsContract,
 		func() { f.logBroadcaster.DependentReady() },
+		min,
+		max,
 	)
 }
 
@@ -352,11 +383,11 @@ type DeviationChecker interface {
 // PollingDeviationChecker polls external price adapters via HTTP to check for price swings.
 type PollingDeviationChecker struct {
 	store          *store.Store
-	fluxAggregator contracts.FluxAggregator
+	fluxAggregator flux_aggregator_wrapper.FluxAggregatorInterface
+	flags          flags_wrapper.FlagsInterface
 	runManager     RunManager
-	logBroadcaster eth.LogBroadcaster
+	logBroadcaster log.Broadcaster
 	fetcher        Fetcher
-	flagsContract  *contracts.Flags
 	oracleAddress  common.Address
 
 	initr         models.Initiator
@@ -373,6 +404,8 @@ type PollingDeviationChecker struct {
 	idleTimer        utils.ResettableTimer
 	roundTimer       utils.ResettableTimer
 
+	minSubmission, maxSubmission *big.Int
+
 	readyForLogs func()
 	chStop       chan struct{}
 	waitOnStop   chan struct{}
@@ -381,21 +414,21 @@ type PollingDeviationChecker struct {
 // NewPollingDeviationChecker returns a new instance of PollingDeviationChecker.
 func NewPollingDeviationChecker(
 	store *store.Store,
-	fluxAggregator contracts.FluxAggregator,
-	logBroadcaster eth.LogBroadcaster,
+	fluxAggregator flux_aggregator_wrapper.FluxAggregatorInterface,
+	flags flags_wrapper.FlagsInterface,
+	logBroadcaster log.Broadcaster,
 	initr models.Initiator,
 	minJobPayment *assets.Link,
 	runManager RunManager,
 	fetcher Fetcher,
-	flagsContract *contracts.Flags,
 	readyForLogs func(),
+	minSubmission, maxSubmission *big.Int,
 ) (*PollingDeviationChecker, error) {
-	return &PollingDeviationChecker{
+	pdc := &PollingDeviationChecker{
 		readyForLogs:     readyForLogs,
 		store:            store,
 		logBroadcaster:   logBroadcaster,
 		fluxAggregator:   fluxAggregator,
-		flagsContract:    flagsContract,
 		initr:            initr,
 		minJobPayment:    minJobPayment,
 		requestData:      initr.RequestData,
@@ -406,6 +439,8 @@ func NewPollingDeviationChecker(
 		hibernationTimer: utils.NewResettableTimer(),
 		idleTimer:        utils.NewResettableTimer(),
 		roundTimer:       utils.NewResettableTimer(),
+		minSubmission:    minSubmission,
+		maxSubmission:    maxSubmission,
 		isHibernating:    false,
 		connected:        abool.New(),
 		backlog: utils.NewBoundedPriorityQueue(map[uint]uint{
@@ -418,7 +453,15 @@ func NewPollingDeviationChecker(
 		chProcessLogs: make(chan struct{}, 1),
 		chStop:        make(chan struct{}),
 		waitOnStop:    make(chan struct{}),
-	}, nil
+	}
+	// This is necessary due to the unfortunate fact that assigning `nil` to an
+	// interface variable causes `x == nil` checks to always return false. If we
+	// do this here, in the constructor, we can avoid using reflection when we
+	// check `p.flags == nil` later in the code.
+	if flags != nil && !reflect.ValueOf(flags).IsNil() {
+		pdc.flags = flags
+	}
+	return pdc, nil
 }
 
 const (
@@ -434,11 +477,15 @@ func (p *PollingDeviationChecker) Start() {
 		"job", p.initr.JobSpecID.String(),
 		"initr", p.initr.ID,
 	)
-	go p.consume()
+
+	go gracefulpanic.WrapRecover(func() {
+		p.consume()
+	})
+
 }
 
 func (p *PollingDeviationChecker) setIsHibernatingStatus() {
-	if p.flagsContract == nil {
+	if p.flags == nil {
 		p.isHibernating = false
 		return
 	}
@@ -452,14 +499,10 @@ func (p *PollingDeviationChecker) setIsHibernatingStatus() {
 }
 
 func (p *PollingDeviationChecker) isFlagLowered() (bool, error) {
-	if p.flagsContract == nil {
+	if p.flags == nil {
 		return true, nil
 	}
-	callOpts := bind.CallOpts{
-		Pending: false,
-		Context: nil,
-	}
-	flags, err := p.flagsContract.GetFlags(&callOpts, []common.Address{utils.ZeroAddress, p.initr.Address})
+	flags, err := p.flags.GetFlags(nil, []common.Address{utils.ZeroAddress, p.initr.Address})
 	if err != nil {
 		return true, err
 	}
@@ -492,16 +535,13 @@ func (p *PollingDeviationChecker) OnDisconnect() {
 	p.connected.UnSet()
 }
 
-func (p *PollingDeviationChecker) JobID() *models.ID { return p.initr.JobSpecID }
-func (p *PollingDeviationChecker) JobIDV2() int32    { return 0 }
-func (p *PollingDeviationChecker) IsV2Job() bool     { return false }
+func (p *PollingDeviationChecker) JobID() models.JobID {
+	return p.initr.JobSpecID
+}
+func (p *PollingDeviationChecker) JobIDV2() int32 { return 0 }
+func (p *PollingDeviationChecker) IsV2Job() bool  { return false }
 
-func (p *PollingDeviationChecker) HandleLog(broadcast eth.LogBroadcast, err error) {
-	if err != nil {
-		logger.Errorf("got error from LogBroadcaster: %v", err)
-		return
-	}
-
+func (p *PollingDeviationChecker) HandleLog(broadcast log.Broadcast) {
 	log := broadcast.DecodedLog()
 	if log == nil || reflect.ValueOf(log).IsNil() {
 		logger.Error("HandleLog: ignoring nil value")
@@ -509,10 +549,10 @@ func (p *PollingDeviationChecker) HandleLog(broadcast eth.LogBroadcast, err erro
 	}
 
 	switch log := log.(type) {
-	case *contracts.LogNewRound:
+	case *flux_aggregator_wrapper.FluxAggregatorNewRound:
 		p.backlog.Add(PriorityNewRoundLog, broadcast)
 
-	case *contracts.LogAnswerUpdated:
+	case *flux_aggregator_wrapper.FluxAggregatorAnswerUpdated:
 		p.backlog.Add(PriorityAnswerUpdatedLog, broadcast)
 
 	case *flags_wrapper.FlagsFlagRaised:
@@ -544,14 +584,25 @@ func (p *PollingDeviationChecker) consume() {
 	}
 
 	// subscribe to contract logs
-	isConnected, unsubscribeFALogs := p.fluxAggregator.SubscribeToLogs(p)
-	defer unsubscribeFALogs()
+	isConnected, unsubscribe := p.logBroadcaster.Register(p, log.ListenerOpts{
+		Contract: p.fluxAggregator,
+		Logs: []generated.AbigenLog{
+			flux_aggregator_wrapper.FluxAggregatorNewRound{},
+			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
+		},
+	})
+	defer unsubscribe()
 
-	if p.flagsContract != nil {
-		flagsLogListener := contracts.NewFlagsDecodingLogListener(p.flagsContract, p)
-		flagsConnected := p.logBroadcaster.Register(p.flagsContract.Address, flagsLogListener)
+	if p.flags != nil {
+		flagsConnected, unsubscribe := p.logBroadcaster.Register(p, log.ListenerOpts{
+			Contract: p.flags,
+			Logs: []generated.AbigenLog{
+				flags_wrapper.FlagsFlagLowered{},
+				flags_wrapper.FlagsFlagRaised{},
+			},
+		})
 		isConnected = isConnected && flagsConnected
-		defer func() { p.logBroadcaster.Unregister(p.flagsContract.Address, flagsLogListener) }()
+		defer unsubscribe()
 	}
 
 	if isConnected {
@@ -610,28 +661,46 @@ func (p *PollingDeviationChecker) consume() {
 }
 
 func (p *PollingDeviationChecker) SetOracleAddress() error {
-	oracleAddrs, err := p.fluxAggregator.GetOracles()
+	log := logger.Default.With(
+		"jobID", p.initr.JobSpecID.String(),
+		"contract", p.initr.Address.Hex(),
+	)
+
+	oracleAddrs, err := p.fluxAggregator.GetOracles(nil)
 	if err != nil {
+		log.Error("failed to get list of oracles from FluxAggregator contract")
+
 		return errors.Wrap(err, "failed to get list of oracles from FluxAggregator contract")
 	}
 	accounts := p.store.KeyStore.Accounts()
 	for _, acct := range accounts {
 		for _, oracleAddr := range oracleAddrs {
-			if acct.Address == oracleAddr {
+			if acct.Address.Hex() == oracleAddr.Hex() {
 				p.oracleAddress = oracleAddr
 				return nil
 			}
 		}
 	}
+
+	log = log.With(
+		"accounts", accounts,
+		"oracleAddresses", oracleAddrs,
+	)
+
 	if len(accounts) > 0 {
 		addr := accounts[0].Address
-		logger.Warnw("None of the node's keys matched any oracle addresses, using first available key. This flux monitor job may not work correctly", "address", addr)
-		p.oracleAddress = addr
-	} else {
-		logger.Error("No keys found. This flux monitor job may not work correctly")
-	}
-	return errors.New("none of the node's keys matched any oracle addresses")
 
+		log.Warnw(
+			"None of the node's keys matched any oracle addresses, using first available key. This flux monitor job may not work correctly",
+			"address", addr.Hex(),
+		)
+		p.oracleAddress = addr
+
+		return nil
+	}
+
+	log.Error("No keys found. This flux monitor job may not work correctly")
+	return errors.New("No keys found")
 }
 
 func (p *PollingDeviationChecker) performInitialPoll() {
@@ -651,7 +720,7 @@ func (p *PollingDeviationChecker) shouldPerformInitialPoll() bool {
 func (p *PollingDeviationChecker) hibernate() {
 	logger.Infof("entering hibernation mode for contract: %s", p.initr.Address.Hex())
 	p.isHibernating = true
-	p.resetTickers(contracts.FluxAggregatorRoundState{})
+	p.resetTickers(flux_aggregator_wrapper.OracleRoundState{})
 }
 
 // reactivate restarts the PollingDeviationChecker without hibernation mode
@@ -665,7 +734,7 @@ func (p *PollingDeviationChecker) reactivate() {
 func (p *PollingDeviationChecker) processLogs() {
 	for !p.backlog.Empty() {
 		maybeBroadcast := p.backlog.Take()
-		broadcast, ok := maybeBroadcast.(eth.LogBroadcast)
+		broadcast, ok := maybeBroadcast.(log.Broadcast)
 		if !ok {
 			logger.Errorf("Failed to convert backlog into LogBroadcast.  Type is %T", maybeBroadcast)
 		}
@@ -682,14 +751,14 @@ func (p *PollingDeviationChecker) processLogs() {
 		}
 
 		switch log := broadcast.DecodedLog().(type) {
-		case *contracts.LogNewRound:
+		case *flux_aggregator_wrapper.FluxAggregatorNewRound:
 			p.respondToNewRoundLog(*log)
 			err = broadcast.MarkConsumed()
 			if err != nil {
 				logger.Errorf("Error marking log as consumed: %v", err)
 			}
 
-		case *contracts.LogAnswerUpdated:
+		case *flux_aggregator_wrapper.FluxAggregatorAnswerUpdated:
 			p.respondToAnswerUpdatedLog(*log)
 			err = broadcast.MarkConsumed()
 			if err != nil {
@@ -722,7 +791,7 @@ func (p *PollingDeviationChecker) processLogs() {
 // The AnswerUpdated log tells us that round has successfully closed with a new
 // answer.  We update our view of the oracleRoundState in case this log was
 // generated by a chain reorg.
-func (p *PollingDeviationChecker) respondToAnswerUpdatedLog(log contracts.LogAnswerUpdated) {
+func (p *PollingDeviationChecker) respondToAnswerUpdatedLog(log flux_aggregator_wrapper.FluxAggregatorAnswerUpdated) {
 	logger.Debugw("AnswerUpdated log", p.loggerFieldsForAnswerUpdated(log)...)
 
 	roundState, err := p.roundState(0)
@@ -735,10 +804,17 @@ func (p *PollingDeviationChecker) respondToAnswerUpdatedLog(log contracts.LogAns
 
 // The NewRound log tells us that an oracle has initiated a new round.  This tells us that we
 // need to poll and submit an answer to the contract regardless of the deviation.
-func (p *PollingDeviationChecker) respondToNewRoundLog(log contracts.LogNewRound) {
-	logger.Debugw("NewRound log", p.loggerFieldsForNewRound(log)...)
+func (p *PollingDeviationChecker) respondToNewRoundLog(log flux_aggregator_wrapper.FluxAggregatorNewRound) {
+	l := logger.Default.With(
+		"round", log.RoundId,
+		"startedBy", log.StartedBy.Hex(),
+		"startedAt", log.StartedAt.String(),
+		"contract", p.fluxAggregator.Address().Hex(),
+		"jobID", p.initr.JobSpecID,
+	)
+	l.Debugw("NewRound log")
 
-	promSetBigInt(promFMSeenRound.WithLabelValues(p.initr.JobSpecID.String()), log.RoundId)
+	promfm.SetBigInt(promfm.SeenRound.WithLabelValues(p.initr.JobSpecID.String()), log.RoundId)
 
 	//
 	// NewRound answer submission logic:
@@ -790,21 +866,21 @@ func (p *PollingDeviationChecker) respondToNewRoundLog(log contracts.LogNewRound
 
 	mostRecentRoundID, err := p.store.MostRecentFluxMonitorRoundID(p.initr.Address)
 	if err != nil && err != gorm.ErrRecordNotFound {
-		logger.Errorw(fmt.Sprintf("error fetching Flux Monitor most recent round ID from DB: %v", err), p.loggerFieldsForNewRound(log)...)
+		l.Errorw("error fetching Flux Monitor most recent round ID from DB", "err", err)
 		return
 	}
 
 	if logRoundID < mostRecentRoundID {
 		err = p.store.DeleteFluxMonitorRoundsBackThrough(p.initr.Address, logRoundID)
 		if err != nil {
-			logger.Errorw(fmt.Sprintf("error deleting reorged Flux Monitor rounds from DB: %v", err), p.loggerFieldsForNewRound(log)...)
+			l.Errorw("error deleting reorged Flux Monitor rounds from DB", "err", err)
 			return
 		}
 	}
 
 	roundStats, jobRunStatus, err := p.statsAndStatusForRound(logRoundID)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("error determining round stats / run status for round: %v", err), p.loggerFieldsForNewRound(log)...)
+		l.Errorw("error determining round stats / run status for round", "err", err)
 		return
 	}
 
@@ -815,54 +891,66 @@ func (p *PollingDeviationChecker) respondToNewRoundLog(log contracts.LogNewRound
 		// If our previous attempt is still pending, return early and don't re-submit
 		// If our previous attempt is already over (completed or errored), we should retry
 		if !jobRunStatus.Finished() {
-			logger.Debugw("Ignoring new round request: started round simultaneously with another node", p.loggerFieldsForNewRound(log)...)
+			l.Debugw("Ignoring new round request: started round simultaneously with another node")
 			return
 		}
 	}
 
 	// Ignore rounds we started
 	if p.oracleAddress == log.StartedBy {
-		logger.Infow("Ignoring new round request: we started this round", p.loggerFieldsForNewRound(log)...)
+		l.Infow("Ignoring new round request: we started this round")
 		return
 	}
 
 	// Ignore rounds we're not eligible for, or for which we won't be paid
 	roundState, err := p.roundState(logRoundID)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("Ignoring new round request: error fetching eligibility from contract: %v", err), p.loggerFieldsForNewRound(log)...)
+		l.Errorw("Ignoring new round request: error fetching eligibility from contract", "err", err)
 		return
 	}
 	p.resetTickers(roundState)
 	err = p.checkEligibilityAndAggregatorFunding(roundState)
 	if err != nil {
-		logger.Infow(fmt.Sprintf("Ignoring new round request: %v", err), p.loggerFieldsForNewRound(log)...)
+		l.Infow("Ignoring new round request", "err", err)
 		return
 	}
 
-	logger.Infow("Responding to new round request", p.loggerFieldsForNewRound(log)...)
+	l.Infow("Responding to new round request")
 
-	request, err := models.MarshalToMap(&roundState)
+	// Best effort to attach metadata.
+	var metaDataForBridge map[string]interface{}
+	lrd, err := p.fluxAggregator.LatestRoundData(nil)
 	if err != nil {
-		logger.Warnw("Error marshalling roundState for request meta", p.loggerFieldsForNewRound(log)...)
+		l.Warnw("Couldn't read latest round data for request meta", "err", err)
+	} else {
+		metaDataForBridge, err = models.MarshalBridgeMetaData(lrd.Answer, lrd.UpdatedAt)
+		if err != nil {
+			l.Warnw("Error marshalling roundState for request meta", "err", err)
+		}
+	}
+
+	ctx, cancel := utils.CombinedContext(p.chStop)
+	defer cancel()
+	polledAnswer, err := p.fetcher.Fetch(ctx, metaDataForBridge)
+	if err != nil {
+		l.Errorw("unable to fetch median price", "err", err)
 		return
 	}
 
-	polledAnswer, err := p.fetcher.Fetch(request)
-	if err != nil {
-		logger.Errorw(fmt.Sprintf("unable to fetch median price: %v", err), p.loggerFieldsForNewRound(log)...)
+	if !p.isValidSubmission(logger.Default.SugaredLogger, polledAnswer) {
 		return
 	}
 
 	var payment assets.Link
 	if roundState.PaymentAmount == nil {
-		logger.Error("roundState.PaymentAmount shouldn't be nil")
+		l.Error("roundState.PaymentAmount shouldn't be nil")
 	} else {
 		payment = assets.Link(*roundState.PaymentAmount)
 	}
 
 	err = p.createJobRun(polledAnswer, logRoundID, &payment)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("unable to create job run: %v", err), p.loggerFieldsForNewRound(log)...)
+		l.Errorw("unable to create job run", "err", err)
 		return
 	}
 }
@@ -873,7 +961,7 @@ var (
 	ErrPaymentTooLow = errors.New("round payment amount < minimum contract payment")
 )
 
-func (p *PollingDeviationChecker) checkEligibilityAndAggregatorFunding(roundState contracts.FluxAggregatorRoundState) error {
+func (p *PollingDeviationChecker) checkEligibilityAndAggregatorFunding(roundState flux_aggregator_wrapper.OracleRoundState) error {
 	if !roundState.EligibleToSubmit {
 		return ErrNotEligible
 	} else if !p.sufficientFunds(roundState) {
@@ -888,7 +976,7 @@ const MinFundedRounds int64 = 3
 
 // sufficientFunds checks if the contract has sufficient funding to pay all the oracles on a
 // conract for a minimum number of rounds, based on the payment amount in the contract
-func (p *PollingDeviationChecker) sufficientFunds(state contracts.FluxAggregatorRoundState) bool {
+func (p *PollingDeviationChecker) sufficientFunds(state flux_aggregator_wrapper.OracleRoundState) bool {
 	min := big.NewInt(int64(state.OracleCount))
 	min = min.Mul(min, big.NewInt(MinFundedRounds))
 	min = min.Mul(min, state.PaymentAmount)
@@ -913,15 +1001,15 @@ type DeviationThresholds struct {
 }
 
 func (p *PollingDeviationChecker) pollIfEligible(thresholds DeviationThresholds) {
-	loggerFields := []interface{}{
+	l := logger.Default.With(
 		"jobID", p.initr.JobSpecID,
 		"address", p.initr.InitiatorParams.Address,
 		"threshold", thresholds.Rel,
 		"absoluteThreshold", thresholds.Abs,
-	}
+	)
 
 	if !p.connected.IsSet() {
-		logger.Warnw("not connected to Ethereum node, skipping poll", loggerFields...)
+		l.Warnw("not connected to Ethereum node, skipping poll")
 		return
 	}
 
@@ -939,97 +1027,119 @@ func (p *PollingDeviationChecker) pollIfEligible(thresholds DeviationThresholds)
 	// Ask the FluxAggregator which round we should be submitting to, and what the state of that round is.
 	roundState, err := p.roundState(0)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("unable to determine eligibility to submit from FluxAggregator contract: %v", err), loggerFields...)
+		l.Errorw("unable to determine eligibility to submit from FluxAggregator contract", "err", err)
 		p.store.UpsertErrorFor(p.JobID(), "Unable to call roundState method on provided contract. Check contract address.")
 		return
 	}
 	p.resetTickers(roundState)
-	loggerFields = append(loggerFields, "reportableRound", roundState.ReportableRoundID)
+	l = l.With("reportableRound", roundState.RoundId)
 
-	roundStats, jobRunStatus, err := p.statsAndStatusForRound(roundState.ReportableRoundID)
+	roundStats, jobRunStatus, err := p.statsAndStatusForRound(roundState.RoundId)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("error determining round stats / run status for round: %v", err), loggerFields...)
+		l.Errorw("error determining round stats / run status for round", "err", err)
 		return
 	}
 
 	// If we've already successfully submitted to this round (ie through a NewRound log)
 	// and the associated JobRun hasn't errored, skip polling
 	if roundStats.NumSubmissions > 0 && !jobRunStatus.Errored() {
-		logger.Infow("skipping poll: round already answered, tx unconfirmed", loggerFields...)
+		l.Infow("skipping poll: round already answered, tx unconfirmed")
 		return
 	}
 
 	// Don't submit if we're not eligible, or won't get paid
 	err = p.checkEligibilityAndAggregatorFunding(roundState)
 	if err != nil {
-		logger.Infow(fmt.Sprintf("skipping poll: %v", err), loggerFields...)
+		l.Infow(fmt.Sprintf("skipping poll: %v", err))
 		return
 	}
 
-	request, err := models.MarshalToMap(&roundState)
+	// Best effort to attach metadata.
+	var metaDataForBridge map[string]interface{}
+	lrd, err := p.fluxAggregator.LatestRoundData(nil)
 	if err != nil {
-		logger.Warnw("Error marshalling roundState for request meta", loggerFields...)
-		return
+		l.Warnw("Couldn't read latest round data for request meta", "err", err)
+	} else {
+		metaDataForBridge, err = models.MarshalBridgeMetaData(lrd.Answer, lrd.UpdatedAt)
+		if err != nil {
+			l.Warnw("Error marshalling roundState for request meta", "err", err)
+		}
 	}
 
-	polledAnswer, err := p.fetcher.Fetch(request)
+	ctx, cancel := utils.CombinedContext(p.chStop)
+	defer cancel()
+	polledAnswer, err := p.fetcher.Fetch(ctx, metaDataForBridge)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("can't fetch answer: %v", err), loggerFields...)
+		l.Errorw("can't fetch answer", "err", err)
 		p.store.UpsertErrorFor(p.JobID(), "Error polling")
 		return
 	}
 
-	jobSpecID := p.initr.JobSpecID.String()
-	latestAnswer := decimal.NewFromBigInt(roundState.LatestAnswer, -p.precision)
-
-	promSetDecimal(promFMSeenValue.WithLabelValues(jobSpecID), polledAnswer)
-	loggerFields = append(loggerFields,
-		"latestAnswer", latestAnswer,
-		"polledAnswer", polledAnswer,
-	)
-	if roundState.ReportableRoundID > 1 && !OutsideDeviation(latestAnswer, polledAnswer, thresholds) {
-		logger.Debugw("deviation < threshold, not submitting", loggerFields...)
+	if !p.isValidSubmission(l, polledAnswer) {
 		return
 	}
 
-	if roundState.ReportableRoundID > 1 {
-		logger.Infow("deviation > threshold, starting new round", loggerFields...)
+	jobSpecID := p.initr.JobSpecID.String()
+	latestAnswer := decimal.NewFromBigInt(roundState.LatestSubmission, -p.precision)
+
+	promfm.SetDecimal(promfm.SeenValue.WithLabelValues(jobSpecID), polledAnswer)
+	l = l.With(
+		"latestAnswer", latestAnswer,
+		"polledAnswer", polledAnswer,
+	)
+	if roundState.RoundId > 1 && !OutsideDeviation(latestAnswer, polledAnswer, thresholds) {
+		l.Debugw("deviation < threshold, not submitting")
+		return
+	}
+
+	if roundState.RoundId > 1 {
+		l.Infow("deviation > threshold, starting new round")
 	} else {
-		logger.Infow("starting first round", loggerFields...)
+		l.Infow("starting first round")
 	}
 
 	var payment assets.Link
 	if roundState.PaymentAmount == nil {
-		logger.Error("roundState.PaymentAmount shouldn't be nil")
+		l.Error("roundState.PaymentAmount shouldn't be nil")
 	} else {
 		payment = assets.Link(*roundState.PaymentAmount)
 	}
 
-	err = p.createJobRun(polledAnswer, roundState.ReportableRoundID, &payment)
+	err = p.createJobRun(polledAnswer, roundState.RoundId, &payment)
 	if err != nil {
-		logger.Errorw(fmt.Sprintf("can't create job run: %v", err), loggerFields...)
+		l.Errorw("can't create job run", "err", err)
 		return
 	}
 
-	promSetDecimal(promFMReportedValue.WithLabelValues(jobSpecID), polledAnswer)
-	promSetUint32(promFMReportedRound.WithLabelValues(jobSpecID), roundState.ReportableRoundID)
+	promfm.SetDecimal(promfm.ReportedValue.WithLabelValues(jobSpecID), polledAnswer)
+	promfm.SetUint32(promfm.ReportedRound.WithLabelValues(jobSpecID), roundState.RoundId)
 }
 
-func (p *PollingDeviationChecker) roundState(roundID uint32) (contracts.FluxAggregatorRoundState, error) {
-	roundState, err := p.fluxAggregator.RoundState(p.oracleAddress, roundID)
-	if err != nil {
-		return contracts.FluxAggregatorRoundState{}, err
+// If the polledAnswer is outside the allowable range, log an error and don't submit.
+// to avoid an onchain reversion.
+func (p *PollingDeviationChecker) isValidSubmission(l *zap.SugaredLogger, polledAnswer decimal.Decimal) bool {
+	max := decimal.NewFromBigInt(p.maxSubmission, -p.precision)
+	min := decimal.NewFromBigInt(p.minSubmission, -p.precision)
+
+	if polledAnswer.GreaterThan(max) || polledAnswer.LessThan(min) {
+		l.Errorw("polled value is outside acceptable range", "min", min, "max", max, "polled value", polledAnswer)
+		p.store.UpsertErrorFor(p.JobID(), "Polled value is outside acceptable range")
+		return false
 	}
-	return roundState, nil
+	return true
+}
+
+func (p *PollingDeviationChecker) roundState(roundID uint32) (flux_aggregator_wrapper.OracleRoundState, error) {
+	return p.fluxAggregator.OracleRoundState(nil, p.oracleAddress, roundID)
 }
 
 // initialRoundState fetches the round information that the fluxmonitor should use when starting
 // new jobs. Choosing the correct round on startup is key to setting timers correctly.
-func (p *PollingDeviationChecker) initialRoundState() contracts.FluxAggregatorRoundState {
-	defaultRoundState := contracts.FluxAggregatorRoundState{
+func (p *PollingDeviationChecker) initialRoundState() flux_aggregator_wrapper.OracleRoundState {
+	defaultRoundState := flux_aggregator_wrapper.OracleRoundState{
 		StartedAt: uint64(time.Now().Unix()),
 	}
-	latestRoundData, err := p.fluxAggregator.LatestRoundData()
+	latestRoundData, err := p.fluxAggregator.LatestRoundData(nil)
 	if err != nil {
 		logger.Warnf(
 			"unable to retrieve latestRoundData for FluxAggregator contract %s - defaulting "+
@@ -1039,13 +1149,13 @@ func (p *PollingDeviationChecker) initialRoundState() contracts.FluxAggregatorRo
 		)
 		return defaultRoundState
 	}
-	roundID := uint32(latestRoundData.RoundID.Uint64())
-	latestRoundState, err := p.fluxAggregator.RoundState(p.oracleAddress, roundID)
+	roundID := uint32(latestRoundData.RoundId.Uint64())
+	latestRoundState, err := p.fluxAggregator.OracleRoundState(nil, p.oracleAddress, roundID)
 	if err != nil {
 		logger.Warnf(
 			"unable to call roundState for latest round, contract: %s, round: %d, err: %v",
 			p.initr.Address.Hex(),
-			latestRoundData.RoundID,
+			latestRoundData.RoundId,
 			err,
 		)
 		return defaultRoundState
@@ -1053,11 +1163,11 @@ func (p *PollingDeviationChecker) initialRoundState() contracts.FluxAggregatorRo
 	return latestRoundState
 }
 
-func (p *PollingDeviationChecker) resetTickers(roundState contracts.FluxAggregatorRoundState) {
+func (p *PollingDeviationChecker) resetTickers(roundState flux_aggregator_wrapper.OracleRoundState) {
 	p.resetPollTicker()
 	p.resetHibernationTimer()
 	p.resetIdleTimer(roundState.StartedAt)
-	p.resetRoundTimer(roundState.TimesOutAt())
+	p.resetRoundTimer(roundStateTimesOutAt(roundState))
 }
 
 func (p *PollingDeviationChecker) setInitialTickers() {
@@ -1145,11 +1255,8 @@ func (p *PollingDeviationChecker) createJobRun(
 	roundID uint32,
 	paymentAmount *assets.Link,
 ) error {
-	methodID, err := p.fluxAggregator.GetMethodID("submit")
-	if err != nil {
-		return err
-	}
 
+	methodID := fluxAggregatorABI.Methods["submit"].ID
 	roundIDData := utils.EVMWordUint64(uint64(roundID))
 
 	payload, err := json.Marshal(jobRunRequest{
@@ -1195,22 +1302,12 @@ func (p *PollingDeviationChecker) loggerFields(added ...interface{}) []interface
 	}...)
 }
 
-func (p *PollingDeviationChecker) loggerFieldsForNewRound(log contracts.LogNewRound) []interface{} {
-	return []interface{}{
-		"round", log.RoundId,
-		"startedBy", log.StartedBy.Hex(),
-		"startedAt", log.StartedAt.String(),
-		"contract", log.Address.Hex(),
-		"jobID", p.initr.JobSpecID,
-	}
-}
-
-func (p *PollingDeviationChecker) loggerFieldsForAnswerUpdated(log contracts.LogAnswerUpdated) []interface{} {
+func (p *PollingDeviationChecker) loggerFieldsForAnswerUpdated(log flux_aggregator_wrapper.FluxAggregatorAnswerUpdated) []interface{} {
 	return []interface{}{
 		"round", log.RoundId,
 		"answer", log.Current.String(),
 		"timestamp", log.UpdatedAt.String(),
-		"contract", log.Address.Hex(),
+		"contract", p.fluxAggregator.Address().Hex(),
 		"job", p.initr.JobSpecID,
 	}
 }
@@ -1270,7 +1367,7 @@ func OutsideDeviation(curAnswer, nextAnswer decimal.Decimal, thresholds Deviatio
 //
 // If system time is not accurate (compared to the cluster) then you should
 // expect poor behaviour here.
-func MakeIdleTimer(log contracts.LogNewRound, idleThreshold models.Duration, clock utils.AfterNower) <-chan time.Time {
+func MakeIdleTimer(log flux_aggregator_wrapper.FluxAggregatorNewRound, idleThreshold models.Duration, clock utils.AfterNower) <-chan time.Time {
 	timeNow := clock.Now()
 	if log.StartedAt == nil {
 		return defaultIdleTimer(idleThreshold, clock)
@@ -1307,11 +1404,15 @@ func (p *PollingDeviationChecker) statsAndStatusForRound(roundID uint32) (
 	}
 	// JobRun will not exist if this is the first time responding to this round
 	var jobRun models.JobRun
-	if roundStats.JobRunID != nil {
-		jobRun, err = p.store.FindJobRun(roundStats.JobRunID)
+	if roundStats.JobRunID.Valid {
+		jobRun, err = p.store.FindJobRun(roundStats.JobRunID.UUID)
 		if err != nil {
 			return models.FluxMonitorRoundStats{}, "", err
 		}
 	}
 	return roundStats, jobRun.Status, nil
+}
+
+func roundStateTimesOutAt(rs flux_aggregator_wrapper.OracleRoundState) uint64 {
+	return rs.StartedAt + rs.Timeout
 }

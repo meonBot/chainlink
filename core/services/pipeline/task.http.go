@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/smartcontractkit/chainlink/core/utils"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
 type (
@@ -91,7 +92,7 @@ func (t *HTTPTask) SetDefaults(inputValues map[string]string, g TaskDAG, self ta
 	return nil
 }
 
-func (t *HTTPTask) Run(ctx context.Context, taskRun TaskRun, inputs []Result) Result {
+func (t *HTTPTask) Run(ctx context.Context, _ JSONSerializable, inputs []Result) Result {
 	if len(inputs) > 0 {
 		return Result{Error: errors.Wrapf(ErrWrongInputCardinality, "HTTPTask requires 0 inputs")}
 	}
@@ -126,11 +127,14 @@ func (t *HTTPTask) Run(ctx context.Context, taskRun TaskRun, inputs []Result) Re
 	start := time.Now()
 	responseBytes, statusCode, err := httpRequest.SendRequest(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return Result{Error: errors.New("http request timed out or interrupted")}
+		}
 		return Result{Error: errors.Wrapf(err, "error making http request")}
 	}
 	elapsed := time.Since(start)
-	promHTTPFetchTime.WithLabelValues(string(taskRun.PipelineTaskSpecID)).Set(float64(elapsed))
-	promHTTPResponseBodySize.WithLabelValues(string(taskRun.PipelineTaskSpecID)).Set(float64(len(responseBytes)))
+	promHTTPFetchTime.WithLabelValues(t.DotID()).Set(float64(elapsed))
+	promHTTPResponseBodySize.WithLabelValues(t.DotID()).Set(float64(len(responseBytes)))
 
 	if statusCode >= 400 {
 		maybeErr := bestEffortExtractError(responseBytes)
@@ -140,8 +144,13 @@ func (t *HTTPTask) Run(ctx context.Context, taskRun TaskRun, inputs []Result) Re
 	logger.Debugw("HTTP task got response",
 		"response", string(responseBytes),
 		"url", t.URL.String(),
+		"dotID", t.DotID(),
 	)
-	return Result{Value: responseBytes}
+	// NOTE: We always stringify the response since this is required for all current jobs.
+	// If a binary response is required we might consider adding an adapter
+	// flag such as  "BinaryMode: true" which passes through raw binary as the
+	// value instead.
+	return Result{Value: string(responseBytes)}
 }
 
 func (t *HTTPTask) allowUnrestrictedNetworkAccess() bool {

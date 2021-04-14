@@ -2,6 +2,7 @@
 
 ENVIRONMENT ?= release
 
+GOPATH ?= $(HOME)/go
 BUILDER ?= smartcontract/builder
 REPO := smartcontract/chainlink
 COMMIT_SHA ?= $(shell git rev-parse HEAD)
@@ -42,6 +43,7 @@ yarndep: ## Ensure all yarn dependencies are installed
 
 .PHONY: install-chainlink
 install-chainlink: chainlink ## Install the chainlink binary.
+	mkdir -p $(GOBIN)
 	cp $< $(GOBIN)/chainlink
 
 chainlink: operator-ui ## Build the chainlink binary.
@@ -71,7 +73,7 @@ abigen:
 	./tools/bin/build_abigen
 
 .PHONY: go-solidity-wrappers
-go-solidity-wrappers: abigen ## Recompiles solidity contracts and their go wrappers
+go-solidity-wrappers: tools/bin/abigen ## Recompiles solidity contracts and their go wrappers
 	yarn workspace @chainlink/contracts compile:clean
 	go generate ./core/internal/gethwrappers
 	go run ./packr/main.go ./core/services/eth/

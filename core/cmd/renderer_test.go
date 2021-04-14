@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/smartcontractkit/chainlink/core/services/eth"
 
@@ -14,9 +15,52 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/web"
+	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRendererJSON_RenderVRFKeys(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	r := cmd.RendererJSON{Writer: ioutil.Discard}
+	keys := []cmd.VRFKeyPresenter{
+		{
+			Compressed:   "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4d01",
+			Uncompressed: "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4db44652a69526181101d4aa9a58ecf43b1be972330de99ea5e540f56f4e0a672f",
+			Hash:         "0x9926c5f19ec3b3ce005e1c183612f05cfc042966fcdd82ec6e78bf128d91695a",
+			CreatedAt:    &now,
+			UpdatedAt:    &now,
+			DeletedAt:    nil,
+		},
+	}
+	assert.NoError(t, r.Render(&keys))
+}
+
+func TestRendererTable_RenderVRKKeys(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	buffer := bytes.NewBufferString("")
+	r := cmd.RendererTable{Writer: buffer}
+	keys := []cmd.VRFKeyPresenter{
+		{
+			Compressed:   "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4d01",
+			Uncompressed: "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4db44652a69526181101d4aa9a58ecf43b1be972330de99ea5e540f56f4e0a672f",
+			Hash:         "0x9926c5f19ec3b3ce005e1c183612f05cfc042966fcdd82ec6e78bf128d91695a",
+			CreatedAt:    &now,
+			UpdatedAt:    &now,
+			DeletedAt:    nil,
+		},
+	}
+	assert.NoError(t, r.Render(&keys))
+	output := buffer.String()
+	assert.Contains(t, output, "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4d01")
+	assert.Contains(t, output, "0xe2c659dd73ded1663c0caf02304aac5ccd247047b3993d273a8920bba0402f4db44652a69526181101d4aa9a58ecf43b1be972330de99ea5e540f56f4e0a672f")
+	assert.Contains(t, output, "0x9926c5f19ec3b3ce005e1c183612f05cfc042966fcdd82ec6e78bf128d91695a")
+
+}
 
 func TestRendererJSON_RenderJobs(t *testing.T) {
 	t.Parallel()
@@ -37,6 +81,37 @@ func TestRendererTable_RenderJobs(t *testing.T) {
 
 	output := buffer.String()
 	assert.Contains(t, output, "noop")
+}
+
+func TestRendererTable_RenderJobsV2(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	buffer := bytes.NewBufferString("")
+	r := cmd.RendererTable{Writer: buffer}
+	jobs := []cmd.Job{
+		{
+			JAID: cmd.JAID{ID: "1"},
+			Name: "Test Job",
+			Type: cmd.DirectRequestJob,
+			DirectRequestSpec: &cmd.DirectRequestSpec{
+				CreatedAt: now,
+			},
+			PipelineSpec: cmd.PipelineSpec{
+				DotDAGSource: "    ds1          [type=http method=GET url=\"example.com\" allowunrestrictednetworkaccess=\"true\"];\n    ds1_parse    [type=jsonparse path=\"USD\"];\n    ds1_multiply [type=multiply times=100];\n    ds1 -\u003e ds1_parse -\u003e ds1_multiply;\n",
+			},
+		},
+	}
+	assert.NoError(t, r.Render(&jobs))
+
+	output := buffer.String()
+	assert.Contains(t, output, "1")
+	assert.Contains(t, output, "Test Job")
+	assert.Contains(t, output, now.Format(time.RFC3339))
+	assert.Contains(t, output, "directrequest")
+	assert.Contains(t, output, "ds1 http")
+	assert.Contains(t, output, "ds1_parse jsonparse")
+	assert.Contains(t, output, "ds1_multiply multiply")
 }
 
 func TestRendererTable_RenderConfiguration(t *testing.T) {
@@ -218,7 +293,7 @@ func TestRendererTable_Render_Tx(t *testing.T) {
 
 	from := cltest.NewAddress()
 	to := cltest.NewAddress()
-	tx := presenters.EthTx{
+	tx := webpresenters.EthTxResource{
 		Hash:     cltest.NewHash(),
 		Nonce:    "1",
 		From:     &from,
@@ -244,7 +319,7 @@ func TestRendererTable_Render_Txs(t *testing.T) {
 	t.Parallel()
 
 	a := cltest.NewAddress()
-	txs := []presenters.EthTx{
+	txs := []webpresenters.EthTxResource{
 		{
 			Hash:     cltest.NewHash(),
 			Nonce:    "1",

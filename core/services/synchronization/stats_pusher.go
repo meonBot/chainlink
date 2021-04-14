@@ -1,9 +1,9 @@
 package synchronization
 
 import (
-	"context"
 	"encoding/json"
 	"net/url"
+	"reflect"
 	"sync"
 	"time"
 
@@ -11,11 +11,11 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/utils"
 
-	"github.com/jinzhu/gorm"
 	"github.com/jpillora/backoff"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"gorm.io/gorm"
 )
 
 var (
@@ -58,9 +58,9 @@ type statsPusher struct {
 	DB             *gorm.DB
 	ExplorerClient ExplorerClient
 	Period         time.Duration
-	cancel         context.CancelFunc
 	clock          utils.Afterer
 	backoffSleeper backoff.Backoff
+	done           chan struct{}
 	waker          chan struct{}
 }
 
@@ -87,6 +87,7 @@ func NewStatsPusher(db *gorm.DB, explorerClient ExplorerClient, afters ...utils.
 			Min: 1 * time.Second,
 			Max: 5 * time.Minute,
 		},
+		done:  make(chan struct{}),
 		waker: make(chan struct{}, 1),
 	}
 }
@@ -104,25 +105,31 @@ func (sp *statsPusher) GetStatus() ConnectionStatus {
 // Start starts the stats pusher
 func (sp *statsPusher) Start() error {
 	gormCallbacksMutex.Lock()
-	sp.DB.Callback().Create().Register(createCallbackName, createSyncEventWithStatsPusher(sp))
-	sp.DB.Callback().Update().Register(updateCallbackName, createSyncEventWithStatsPusher(sp))
+	err := sp.DB.Callback().Create().Register(createCallbackName, createSyncEventWithStatsPusher(sp))
+	if err != nil {
+		return err
+	}
+	err = sp.DB.Callback().Update().Register(updateCallbackName, createSyncEventWithStatsPusher(sp))
+	if err != nil {
+		return err
+	}
 	gormCallbacksMutex.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	sp.cancel = cancel
-	go sp.eventLoop(ctx)
+	go sp.eventLoop()
 	return nil
 }
 
 // Close shuts down the stats pusher
 func (sp *statsPusher) Close() error {
-	if sp.cancel != nil {
-		sp.cancel()
-	}
+	close(sp.done)
 
 	gormCallbacksMutex.Lock()
-	sp.DB.Callback().Create().Remove(createCallbackName)
-	sp.DB.Callback().Update().Remove(updateCallbackName)
+	if err := sp.DB.Callback().Create().Remove(createCallbackName); err != nil {
+		return err
+	}
+	if err := sp.DB.Callback().Update().Remove(updateCallbackName); err != nil {
+		return err
+	}
 	gormCallbacksMutex.Unlock()
 
 	return nil
@@ -140,10 +147,11 @@ type response struct {
 	Status int `json:"status"`
 }
 
-func (sp *statsPusher) eventLoop(parentCtx context.Context) {
+func (sp *statsPusher) eventLoop() {
 	logger.Debugw("Entered StatsPusher event loop")
+
 	for {
-		err := sp.pusherLoop(parentCtx)
+		err := sp.pusherLoop()
 		if err == nil {
 			return
 		}
@@ -152,7 +160,7 @@ func (sp *statsPusher) eventLoop(parentCtx context.Context) {
 		logger.Warnw("Failure during event synchronization", "error", err.Error(), "sleep_duration", duration)
 
 		select {
-		case <-parentCtx.Done():
+		case <-sp.done:
 			return
 		case <-sp.clock.After(duration):
 			continue
@@ -160,7 +168,7 @@ func (sp *statsPusher) eventLoop(parentCtx context.Context) {
 	}
 }
 
-func (sp *statsPusher) pusherLoop(parentCtx context.Context) error {
+func (sp *statsPusher) pusherLoop() error {
 	for {
 		select {
 		case <-sp.waker:
@@ -173,7 +181,7 @@ func (sp *statsPusher) pusherLoop(parentCtx context.Context) error {
 			if err != nil {
 				return err
 			}
-		case <-parentCtx.Done():
+		case <-sp.done:
 			return nil
 		}
 	}
@@ -214,11 +222,19 @@ func (sp *statsPusher) AllSyncEvents(cb func(models.SyncEvent) error) error {
 }
 
 func (sp *statsPusher) syncEvent(event models.SyncEvent) error {
-	sp.ExplorerClient.Send([]byte(event.Body))
+	ctx, cancel := utils.ContextFromChan(sp.done)
+	defer cancel()
+
+	sp.ExplorerClient.Send(ctx, []byte(event.Body))
+	if ctx.Err() != nil {
+		return nil
+	}
 	numberEventsSent.Inc()
 
-	message, err := sp.ExplorerClient.Receive()
-	if err != nil {
+	message, err := sp.ExplorerClient.Receive(ctx)
+	if ctx.Err() != nil {
+		return nil
+	} else if err != nil {
 		return errors.Wrap(err, "syncEvent#ExplorerClient.Receive failed")
 	}
 
@@ -232,44 +248,54 @@ func (sp *statsPusher) syncEvent(event models.SyncEvent) error {
 		return errors.New("event not created")
 	}
 
-	err = sp.DB.Delete(event).Error
-	if err != nil {
+	err = sp.DB.WithContext(ctx).Delete(event).Error
+	if ctx.Err() != nil {
+	} else if err != nil {
 		return errors.Wrap(err, "syncEvent#DB.Delete failed")
 	}
 
 	return nil
 }
 
-func createSyncEventWithStatsPusher(sp StatsPusher) func(*gorm.Scope) {
-	return func(scope *gorm.Scope) {
-		if scope.HasError() {
+func createSyncEventWithStatsPusher(sp StatsPusher) func(*gorm.DB) {
+	return func(db *gorm.DB) {
+		if db.Error != nil {
 			return
 		}
 
-		if scope.TableName() != "job_runs" {
+		if db.Statement.Table != "job_runs" {
 			return
 		}
 
-		run, ok := scope.Value.(*models.JobRun)
+		if db.Statement.ReflectValue.Type() != reflect.TypeOf(models.JobRun{}) {
+			logger.Errorf("Invariant violated scope.Value %T is not type models.JobRun, but TableName was job_runs", db.Statement.ReflectValue.Type())
+			return
+		}
+
+		run, ok := db.Statement.ReflectValue.Interface().(models.JobRun)
 		if !ok {
-			logger.Error("Invariant violated scope.Value is not type *models.JobRun, but TableName was job_runes")
+			db.Error = errors.Errorf("expected models.JobRun")
 			return
 		}
 
-		presenter := SyncJobRunPresenter{run}
-		bodyBytes, err := json.Marshal(presenter)
-		if err != nil {
-			_ = scope.Err(errors.Wrap(err, "createSyncEvent#json.Marshal failed"))
-			return
-		}
-
-		event := models.SyncEvent{
-			Body: string(bodyBytes),
-		}
-		err = scope.DB().Create(&event).Error
-		if err != nil {
-			_ = scope.Err(errors.Wrap(err, "createSyncEvent#Create failed"))
-			return
-		}
+		// Note we have to use a separate db instance here
+		// as the argument is part of a chain already targeting the job_runs table.
+		db.Error = InsertSyncEventForJobRun(sp.(*statsPusher).DB, &run)
 	}
+}
+
+// InsertSyncEventForJobRun generates an event for a change to job_runs
+func InsertSyncEventForJobRun(db *gorm.DB, run *models.JobRun) error {
+	presenter := SyncJobRunPresenter{run}
+	bodyBytes, err := json.Marshal(presenter)
+	if err != nil {
+		return errors.Wrap(err, "createSyncEvent#json.Marshal failed")
+	}
+
+	event := models.SyncEvent{
+		Body: string(bodyBytes),
+	}
+
+	err = db.Create(&event).Error
+	return errors.Wrap(err, "createSyncEvent#Create failed")
 }

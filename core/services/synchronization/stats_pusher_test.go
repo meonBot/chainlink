@@ -8,9 +8,9 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
 
-	"github.com/jinzhu/gorm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestStatsPusher(t *testing.T) {
@@ -28,12 +28,12 @@ func TestStatsPusher(t *testing.T) {
 	pusher.Start()
 	defer pusher.Close()
 
-	require.NoError(t, store.ORM.RawDB(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
+	require.NoError(t, store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
 	pusher.PushNow()
 
 	assert.Equal(t, 1, lenSyncEvents(t, store.ORM), "jobrun sync event should be created")
 	cltest.CallbackOrTimeout(t, "ws server receives jobrun creation", func() {
-		<-wsserver.Received
+		<-wsserver.ReceivedText
 		err := wsserver.Broadcast(`{"status": 201}`)
 		assert.NoError(t, err)
 	})
@@ -56,14 +56,14 @@ func TestStatsPusher_ClockTrigger(t *testing.T) {
 	pusher.Start()
 	defer pusher.Close()
 
-	err = store.ORM.RawDB(func(db *gorm.DB) error {
+	err = store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		return db.Save(&models.SyncEvent{Body: string("")}).Error
 	})
 	require.NoError(t, err)
 
 	clock.Trigger()
 	cltest.CallbackOrTimeout(t, "ws server receives jobrun update", func() {
-		<-wsserver.Received
+		<-wsserver.ReceivedText
 		err := wsserver.Broadcast(`{"status": 201}`)
 		assert.NoError(t, err)
 	})
@@ -85,12 +85,12 @@ func TestStatsPusher_NoAckLeavesEvent(t *testing.T) {
 	pusher.Start()
 	defer pusher.Close()
 
-	require.NoError(t, store.ORM.RawDB(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
+	require.NoError(t, store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
 	pusher.PushNow()
 
 	assert.Equal(t, 1, lenSyncEvents(t, store.ORM), "jobrun sync event should be created")
 	cltest.CallbackOrTimeout(t, "ws server receives jobrun creation", func() {
-		<-wsserver.Received
+		<-wsserver.ReceivedText
 	})
 	cltest.AssertSyncEventCountStays(t, store.ORM, 1)
 }
@@ -111,12 +111,12 @@ func TestStatsPusher_BadSyncLeavesEvent(t *testing.T) {
 	pusher.Start()
 	defer pusher.Close()
 
-	require.NoError(t, store.ORM.RawDB(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
+	require.NoError(t, store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error { return db.Create(&models.SyncEvent{}).Error }))
 
 	assert.Equal(t, 1, lenSyncEvents(t, store.ORM), "jobrun sync event should be created")
 	clock.Trigger()
 	cltest.CallbackOrTimeout(t, "ws server receives jobrun creation", func() {
-		<-wsserver.Received
+		<-wsserver.ReceivedText
 		err := wsserver.Broadcast(`{"status": 500}`)
 		assert.NoError(t, err)
 	})

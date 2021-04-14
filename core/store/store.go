@@ -3,12 +3,17 @@ package store
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
+	"github.com/coreos/go-semver/semver"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/periodicbackup"
+	"github.com/smartcontractkit/chainlink/core/static"
+
+	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
 	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
 	"github.com/smartcontractkit/chainlink/core/services/postgres"
@@ -18,9 +23,9 @@ import (
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/jinzhu/gorm"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
+	"gorm.io/gorm"
 )
 
 const (
@@ -61,13 +66,13 @@ func InsecureKeyStoreGen(config *orm.Config) *KeyStore {
 }
 
 // NewStore will create a new store
-func NewStore(config *orm.Config, ethClient eth.Client, advisoryLock postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal, keyStoreGenerator KeyStoreGenerator) *Store {
+func NewStore(config *orm.Config, ethClient eth.Client, advisoryLock postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal, keyStoreGenerator KeyStoreGenerator) (*Store, error) {
 	return newStoreWithKeyStore(config, ethClient, advisoryLock, keyStoreGenerator, shutdownSignal)
 }
 
 // NewInsecureStore creates a new store with the given config using an insecure keystore.
 // NOTE: Should only be used for testing!
-func NewInsecureStore(config *orm.Config, ethClient eth.Client, advisoryLocker postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal) *Store {
+func NewInsecureStore(config *orm.Config, ethClient eth.Client, advisoryLocker postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal) (*Store, error) {
 	return newStoreWithKeyStore(config, ethClient, advisoryLocker, InsecureKeyStoreGen, shutdownSignal)
 }
 
@@ -79,16 +84,17 @@ func newStoreWithKeyStore(
 	advisoryLocker postgres.AdvisoryLocker,
 	keyStoreGenerator KeyStoreGenerator,
 	shutdownSignal gracefulpanic.Signal,
-) *Store {
+) (*Store, error) {
 	if err := utils.EnsureDirAndMaxPerms(config.RootDir(), os.FileMode(0700)); err != nil {
-		logger.Fatal(fmt.Sprintf("Unable to create project root dir: %+v", err))
+		return nil, errors.Wrap(err, "error while creating project root dir")
 	}
+
 	orm, err := initializeORM(config, shutdownSignal)
 	if err != nil {
-		logger.Fatal(fmt.Sprintf("Unable to initialize ORM: %+v", err))
+		return nil, errors.Wrap(err, "failed to initialize ORM")
 	}
 	if e := orm.ClobberDiskKeyStoreWithDBKeys(config.KeysDir()); e != nil {
-		logger.Fatal(fmt.Sprintf("Unable to migrate key store to disk: %+v", e))
+		return nil, errors.Wrap(err, "error migrating key store to disk")
 	}
 
 	keyStore := keyStoreGenerator(config)
@@ -105,7 +111,7 @@ func newStoreWithKeyStore(
 		closeOnce:      &sync.Once{},
 	}
 	store.VRFKeyStore = NewVRFKeyStore(store)
-	return store
+	return store, nil
 }
 
 // Start initiates all of Store's dependencies
@@ -165,7 +171,7 @@ func (s *Store) SyncDiskKeyStoreToDB() error {
 // DeleteKey hard-deletes a key whose address matches the supplied address.
 func (s *Store) DeleteKey(address common.Address) error {
 	return postgres.GormTransaction(context.Background(), s.ORM.DB, func(tx *gorm.DB) error {
-		err := tx.Where("address = ?", address).Delete(models.Key{}).Error
+		err := tx.Where("address = ?", address).Delete(&models.Key{}).Error
 		if err != nil {
 			return errors.Wrap(err, "while deleting ETH key from DB")
 		}
@@ -175,7 +181,7 @@ func (s *Store) DeleteKey(address common.Address) error {
 
 // ArchiveKey soft-deletes a key whose address matches the supplied address.
 func (s *Store) ArchiveKey(address common.Address) error {
-	err := s.ORM.DB.Where("address = ?", address).Delete(models.Key{}).Error
+	err := s.ORM.DB.Where("address = ?", address).Delete(&models.Key{}).Error
 	if err != nil {
 		return err
 	}
@@ -211,21 +217,81 @@ func (s *Store) ImportKey(keyJSON []byte, oldPassword string) error {
 	})
 }
 
+func CheckSquashUpgrade(db *gorm.DB) error {
+	// Ensure that we don't try to run a node version later than the
+	// squashed database versions without first migrating up to just before the squash.
+	// If we don't see the latest migration and node version >= S, error and recommend
+	// first running version S - 1 (S = version in which migrations are squashed).
+	if static.Version == "unset" {
+		return nil
+	}
+	squashVersionMinus1 := semver.New("0.9.10")
+	currentVersion, err := semver.NewVersion(static.Version)
+	if err != nil {
+		return errors.Wrapf(err, "expected VERSION to be valid semver (for example 1.42.3). Got: %s", static.Version)
+	}
+	lastV1Migration := "1611847145"
+	if squashVersionMinus1.LessThan(*currentVersion) {
+		// Completely empty database is fine to run squashed migrations on
+		if !db.Migrator().HasTable("migrations") {
+			return nil
+		}
+		// Running code later than S - 1. Ensure that we see
+		// the last v1 migration.
+		q := db.Exec("SELECT * FROM migrations WHERE id = ?", lastV1Migration)
+		if q.Error != nil {
+			return q.Error
+		}
+		if q.RowsAffected == 0 {
+			// Do not have the S-1 migration.
+			return errors.Errorf("Need to upgrade to chainlink version %v first before upgrading to version %v in order to run migrations", squashVersionMinus1, currentVersion)
+		}
+	}
+	return nil
+}
+
 func initializeORM(config *orm.Config, shutdownSignal gracefulpanic.Signal) (*orm.ORM, error) {
-	orm, err := orm.NewORM(config.DatabaseURL(), config.DatabaseTimeout(), shutdownSignal, config.GetDatabaseDialectConfiguredOrDefault(), config.GetAdvisoryLockIDConfiguredOrDefault())
+	dbURL := config.DatabaseURL()
+	dbOrm, err := orm.NewORM(dbURL.String(), config.DatabaseTimeout(), shutdownSignal, config.GetDatabaseDialectConfiguredOrDefault(), config.GetAdvisoryLockIDConfiguredOrDefault(), config.GlobalLockRetryInterval().Duration(), config.ORMMaxOpenConns(), config.ORMMaxIdleConns())
 	if err != nil {
 		return nil, errors.Wrap(err, "initializeORM#NewORM")
 	}
-	if config.MigrateDatabase() {
-		orm.SetLogging(config.LogSQLStatements() || config.LogSQLMigrations())
+	if config.DatabaseBackupMode() != orm.DatabaseBackupModeNone {
 
-		err = orm.RawDB(func(db *gorm.DB) error {
+		version, err2 := dbOrm.FindLatestNodeVersion()
+		if err2 != nil {
+			return nil, errors.Wrap(err2, "initializeORM#FindLatestNodeVersion")
+		}
+		var versionString string
+		if version != nil {
+			versionString = version.Version
+		}
+		databaseBackup := periodicbackup.NewDatabaseBackup(config, logger.Default)
+		databaseBackup.RunBackupGracefully(versionString)
+	}
+	if err = CheckSquashUpgrade(dbOrm.DB); err != nil {
+		panic(err)
+	}
+	if config.MigrateDatabase() {
+		dbOrm.SetLogging(config.LogSQLStatements() || config.LogSQLMigrations())
+
+		err = dbOrm.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 			return migrations.Migrate(db)
 		})
 		if err != nil {
 			return nil, errors.Wrap(err, "initializeORM#Migrate")
 		}
 	}
-	orm.SetLogging(config.LogSQLStatements())
-	return orm, nil
+
+	nodeVersion := static.Version
+	if nodeVersion == "unset" {
+		nodeVersion = fmt.Sprintf("random_%d", rand.Uint32())
+	}
+	version := models.NewNodeVersion(nodeVersion)
+	err = dbOrm.UpsertNodeVersion(version)
+	if err != nil {
+		return nil, errors.Wrap(err, "initializeORM#UpsertNodeVersion")
+	}
+	dbOrm.SetLogging(config.LogSQLStatements())
+	return dbOrm, nil
 }

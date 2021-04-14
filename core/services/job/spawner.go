@@ -2,6 +2,7 @@ package job
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
@@ -30,9 +30,8 @@ type (
 	Spawner interface {
 		Start() error
 		Close() error
-		CreateJob(ctx context.Context, spec Spec, name null.String) (int32, error)
+		CreateJob(ctx context.Context, spec Job, name null.String) (int32, error)
 		DeleteJob(ctx context.Context, jobID int32) error
-		RegisterDelegate(delegate Delegate)
 	}
 
 	spawner struct {
@@ -52,9 +51,10 @@ type (
 	// TODO(spook): I can't wait for Go generics
 	Delegate interface {
 		JobType() Type
-		ToDBRow(spec Spec) models.JobSpecV2
-		FromDBRow(spec models.JobSpecV2) Spec
-		ServicesForSpec(spec Spec) ([]Service, error)
+		// ServicesForSpec returns services to be started and stopped for this
+		// job. Services are started in the order they are given and stopped in
+		// reverse order.
+		ServicesForSpec(spec Job) ([]Service, error)
 	}
 )
 
@@ -62,11 +62,11 @@ const checkForDeletedJobsPollInterval = 5 * time.Minute
 
 var _ Spawner = (*spawner)(nil)
 
-func NewSpawner(orm ORM, config Config) *spawner {
+func NewSpawner(orm ORM, config Config, jobTypeDelegates map[Type]Delegate) *spawner {
 	s := &spawner{
 		orm:              orm,
 		config:           config,
-		jobTypeDelegates: make(map[Type]Delegate),
+		jobTypeDelegates: jobTypeDelegates,
 		services:         make(map[int32][]Service),
 		chStopJob:        make(chan int32),
 		chStop:           make(chan struct{}),
@@ -104,17 +104,6 @@ func (js *spawner) destroy() {
 	if err != nil {
 		logger.Error(err)
 	}
-}
-
-func (js *spawner) RegisterDelegate(delegate Delegate) {
-	js.jobTypeDelegatesMu.Lock()
-	defer js.jobTypeDelegatesMu.Unlock()
-
-	if _, exists := js.jobTypeDelegates[delegate.JobType()]; exists {
-		panic("registered job type " + string(delegate.JobType()) + " more than once")
-	}
-	logger.Infof("Registered job type '%v'", delegate.JobType())
-	js.jobTypeDelegates[delegate.JobType()] = delegate
 }
 
 func (js *spawner) runLoop() {
@@ -180,7 +169,7 @@ func (js *spawner) startUnclaimedServices() {
 	ctx, cancel := utils.CombinedContext(js.chStop, 5*time.Second)
 	defer cancel()
 
-	specDBRows, err := js.orm.ClaimUnclaimedJobs(ctx)
+	jobs, err := js.orm.ClaimUnclaimedJobs(ctx)
 	if err != nil {
 		logger.Errorf("Couldn't fetch unclaimed jobs: %v", err)
 		return
@@ -189,38 +178,33 @@ func (js *spawner) startUnclaimedServices() {
 	js.jobTypeDelegatesMu.RLock()
 	defer js.jobTypeDelegatesMu.RUnlock()
 
-	for _, specDBRow := range specDBRows {
-		if _, exists := js.services[specDBRow.ID]; exists {
-			logger.Warnw("Job spawner ORM attempted to claim locally-claimed job, skipping", "jobID", specDBRow.ID)
+	for _, job := range jobs {
+		if _, exists := js.services[job.ID]; exists {
+			logger.Warnw("Job spawner ORM attempted to claim locally-claimed job, skipping", "jobID", job.ID)
 			continue
 		}
 
-		var services []Service
-		for _, delegate := range js.jobTypeDelegates {
-			spec := delegate.FromDBRow(specDBRow)
-			if spec == nil {
-				// This spec isn't owned by this delegate
-				continue
-			}
-
-			moreServices, err := delegate.ServicesForSpec(spec)
-			if err != nil {
-				logger.Errorw("Error creating services for job", "jobID", specDBRow.ID, "error", err)
-				js.orm.RecordError(ctx, specDBRow.ID, err.Error())
-				continue
-			}
-			services = append(services, moreServices...)
+		delegate, exists := js.jobTypeDelegates[job.Type]
+		if !exists {
+			logger.Errorw("Job type has not been registered with job.Spawner", "type", job.Type, "jobID", job.ID)
+			continue
+		}
+		services, err := delegate.ServicesForSpec(job)
+		if err != nil {
+			logger.Errorw("Error creating services for job", "jobID", job.ID, "error", err)
+			js.orm.RecordError(ctx, job.ID, err.Error())
+			continue
 		}
 
-		logger.Infow("Starting services for job", "jobID", specDBRow.ID, "count", len(services))
+		logger.Infow("Starting services for job", "jobID", job.ID, "count", len(services))
 
 		for _, service := range services {
 			err := service.Start()
 			if err != nil {
-				logger.Errorw("Error creating service for job", "jobID", specDBRow.ID, "error", err)
+				logger.Errorw("Error creating service for job", "jobID", job.ID, "error", err)
 				continue
 			}
-			js.services[specDBRow.ID] = append(js.services[specDBRow.ID], service)
+			js.services[job.ID] = append(js.services[job.ID], service)
 		}
 	}
 }
@@ -232,12 +216,14 @@ func (js *spawner) stopAllServices() {
 }
 
 func (js *spawner) stopService(jobID int32) {
-	for _, service := range js.services[jobID] {
+	services := js.services[jobID]
+	for i := len(services) - 1; i >= 0; i-- {
+		service := services[i]
 		err := service.Close()
 		if err != nil {
-			logger.Errorw("Error stopping job service", "jobID", jobID, "error", err)
+			logger.Errorw("Error stopping job service", "jobID", jobID, "error", err, "subservice", i, "serviceType", reflect.TypeOf(service))
 		} else {
-			logger.Infow("Stopped job service", "jobID", jobID)
+			logger.Infow("Stopped job service", "jobID", jobID, "subservice", i, "serviceType", reflect.TypeOf(service))
 		}
 	}
 	delete(js.services, jobID)
@@ -274,29 +260,27 @@ func (js *spawner) handlePGDeleteEvent(ctx context.Context, ev postgres.Event) {
 	js.unloadDeletedJob(ctx, jobID)
 }
 
-func (js *spawner) CreateJob(ctx context.Context, spec Spec, name null.String) (int32, error) {
+func (js *spawner) CreateJob(ctx context.Context, spec Job, name null.String) (int32, error) {
 	js.jobTypeDelegatesMu.Lock()
 	defer js.jobTypeDelegatesMu.Unlock()
 
-	delegate, exists := js.jobTypeDelegates[spec.JobType()]
-	if !exists {
-		logger.Errorf("job type '%s' has not been registered with the job.Spawner", spec.JobType())
-		return 0, errors.Errorf("job type '%s' has not been registered with the job.Spawner", spec.JobType())
+	if _, exists := js.jobTypeDelegates[spec.Type]; !exists {
+		logger.Errorf("job type '%s' has not been registered with the job.Spawner", spec.Type)
+		return 0, errors.Errorf("job type '%s' has not been registered with the job.Spawner", spec.Type)
 	}
 
 	ctx, cancel := utils.CombinedContext(js.chStop, ctx)
 	defer cancel()
 
-	specDBRow := delegate.ToDBRow(spec)
-	specDBRow.Name = name
-	err := js.orm.CreateJob(ctx, &specDBRow, spec.TaskDAG())
+	spec.Name = name
+	err := js.orm.CreateJob(ctx, &spec, spec.Pipeline)
 	if err != nil {
-		logger.Errorw("Error creating job", "type", spec.JobType(), "error", err)
+		logger.Errorw("Error creating job", "type", spec.Type, "error", err)
 		return 0, err
 	}
 
-	logger.Infow("Created job", "type", spec.JobType(), "jobID", specDBRow.ID)
-	return specDBRow.ID, err
+	logger.Infow("Created job", "type", spec.Type, "jobID", spec.ID)
+	return spec.ID, err
 }
 
 func (js *spawner) DeleteJob(ctx context.Context, jobID int32) error {
@@ -304,20 +288,17 @@ func (js *spawner) DeleteJob(ctx context.Context, jobID int32) error {
 		return errors.New("will not delete job with 0 ID")
 	}
 
+	// Stop the service if we own the job.
+	js.stopService(jobID)
+
 	ctx, cancel := utils.CombinedContext(js.chStop, ctx)
 	defer cancel()
-
 	err := js.orm.DeleteJob(ctx, jobID)
 	if err != nil {
 		logger.Errorw("Error deleting job", "jobID", jobID, "error", err)
 		return err
 	}
 	logger.Infow("Deleted job", "jobID", jobID)
-
-	select {
-	case <-js.chStop:
-	case js.chStopJob <- jobID:
-	}
 
 	return nil
 }

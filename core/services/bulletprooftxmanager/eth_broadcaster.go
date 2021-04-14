@@ -1,7 +1,5 @@
 package bulletprooftxmanager
 
-// NOTE: See: https://godoc.org/time#Timer.Stop for an explanation of this pattern
-
 import (
 	"context"
 	"fmt"
@@ -17,8 +15,9 @@ import (
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	gethCommon "github.com/ethereum/go-ethereum/common"
-	"github.com/jinzhu/gorm"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // EthBroadcaster monitors eth_txes for transactions that need to
@@ -36,7 +35,7 @@ import (
 // - existence of a saved eth_tx_attempt
 type EthBroadcaster interface {
 	Start() error
-	Stop() error
+	Close() error
 
 	Trigger()
 
@@ -54,20 +53,24 @@ type ethBroadcaster struct {
 	// trigger allows other goroutines to force ethBroadcaster to rescan the
 	// database early (before the next poll interval)
 	trigger chan struct{}
-	chStop  chan struct{}
-	wg      sync.WaitGroup
+
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	wg        sync.WaitGroup
 
 	utils.StartStopOnce
 }
 
 // NewEthBroadcaster returns a new concrete ethBroadcaster
 func NewEthBroadcaster(store *store.Store, config orm.ConfigReader, eventBroadcaster postgres.EventBroadcaster) EthBroadcaster {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ethBroadcaster{
 		store:            store,
 		config:           config,
 		ethClient:        store.EthClient,
 		trigger:          make(chan struct{}, 1),
-		chStop:           make(chan struct{}),
+		ctx:              ctx,
+		ctxCancel:        cancel,
 		wg:               sync.WaitGroup{},
 		eventBroadcaster: eventBroadcaster,
 	}
@@ -84,6 +87,13 @@ func (eb *ethBroadcaster) Start() error {
 		return errors.Wrap(err, "EthBroadcaster could not start")
 	}
 
+	if eb.config.EthNonceAutoSync() {
+		syncer := NewNonceSyncer(eb.store, eb.config, eb.ethClient)
+		if err := syncer.SyncAll(eb.ctx); err != nil {
+			return errors.Wrap(err, "EthBroadcaster failed to sync with on-chain nonce")
+		}
+	}
+
 	eb.wg.Add(1)
 	go eb.monitorEthTxs()
 
@@ -93,7 +103,7 @@ func (eb *ethBroadcaster) Start() error {
 	return nil
 }
 
-func (eb *ethBroadcaster) Stop() error {
+func (eb *ethBroadcaster) Close() error {
 	if !eb.OkayToStop() {
 		return errors.New("EthBroadcaster is already stopped")
 	}
@@ -102,7 +112,7 @@ func (eb *ethBroadcaster) Stop() error {
 		eb.ethTxInsertListener.Close()
 	}
 
-	close(eb.chStop)
+	eb.ctxCancel()
 	eb.wg.Wait()
 
 	return nil
@@ -121,7 +131,7 @@ func (eb *ethBroadcaster) ethTxInsertTriggerer() {
 		select {
 		case <-eb.ethTxInsertListener.Events():
 			eb.Trigger()
-		case <-eb.chStop:
+		case <-eb.ctx.Done():
 			return
 		}
 	}
@@ -156,7 +166,7 @@ func (eb *ethBroadcaster) monitorEthTxs() {
 		}
 
 		select {
-		case <-eb.chStop:
+		case <-eb.ctx.Done():
 			// NOTE: See: https://godoc.org/time#Timer.Stop for an explanation of this pattern
 			if !pollDBTimer.Stop() {
 				<-pollDBTimer.C
@@ -241,7 +251,7 @@ func (eb *ethBroadcaster) handleAnyInProgressEthTx(fromAddress gethCommon.Addres
 func getInProgressEthTx(store *store.Store, fromAddress gethCommon.Address) (*models.EthTx, error) {
 	etx := &models.EthTx{}
 	err := store.DB.Preload("EthTxAttempts").First(etx, "from_address = ? AND state = 'in_progress'", fromAddress.Bytes()).Error
-	if gorm.IsRecordNotFoundError(err) {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
 	if len(etx.EthTxAttempts) != 1 || etx.EthTxAttempts[0].State != models.EthTxAttemptInProgress {
@@ -258,11 +268,23 @@ func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models
 		return errors.Errorf("invariant violation: expected transaction %v to be in_progress, it was %s", etx.ID, etx.State)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), maxEthNodeRequestTime)
-	defer cancel()
-	sendError := sendTransaction(ctx, eb.ethClient, attempt)
+	sendError := sendTransaction(context.TODO(), eb.ethClient, attempt)
+
+	if sendError.IsTooExpensive() {
+		logger.Errorw("EthBroadcaster: transaction gas price was rejected by the eth node for being too high. Consider increasing your eth node's RPCTxFeeCap (it is suggested to run geth with no cap i.e. --rpc.gascap=0 --rpc.txfeecap=0)",
+			"ethTxID", etx.ID,
+			"err", sendError,
+			"gasPrice", attempt.GasPrice,
+			"gasLimit", etx.GasLimit,
+			"id", "RPCTxFeeCapExceeded",
+		)
+		etx.Error = sendError.StrPtr()
+		// Attempt is thrown away in this case; we don't need it since it never got accepted by a node
+		return saveFatallyErroredTransaction(eb.store, &etx)
+	}
 
 	if sendError.Fatal() {
+		logger.Errorw("EthBroadcaster: fatal error sending transaction", "ethTxID", etx.ID, "error", sendError, "gasLimit", etx.GasLimit, "gasPrice", attempt.GasPrice)
 		etx.Error = sendError.StrPtr()
 		// Attempt is thrown away in this case; we don't need it since it never got accepted by a node
 		return saveFatallyErroredTransaction(eb.store, &etx)
@@ -321,14 +343,23 @@ func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models
 		sendError = nil
 	}
 
-	if sendError != nil {
-		// Any other type of error is considered temporary or resolvable by the
-		// node operator, but will likely prevent other transactions from working.
-		// Safest thing to do is bail out and wait for the next poll.
-		return errors.Wrapf(sendError, "error while sending transaction %v", etx.ID)
+	if sendError.IsInsufficientEth() {
+		logger.Errorw(fmt.Sprintf("EthBroadcaster: EthTxAttempt %v (hash 0x%x) at gas price (%s Wei) was rejected due to insufficient eth. "+
+			"The eth node returned %s. "+
+			"ACTION REQUIRED: Chainlink wallet with address 0x%x is OUT OF FUNDS",
+			attempt.ID, attempt.Hash, attempt.GasPrice.String(), sendError.Error(), etx.FromAddress,
+		), "ethTxID", etx.ID, "err", sendError)
+		return saveAttempt(eb.store, &etx, attempt, models.EthTxAttemptInsufficientEth)
 	}
 
-	return saveUnconfirmed(eb.store, &etx, attempt)
+	if sendError == nil {
+		return saveAttempt(eb.store, &etx, attempt, models.EthTxAttemptBroadcast)
+	}
+
+	// Any other type of error is considered temporary or resolvable by the
+	// node operator, but will likely prevent other transactions from working.
+	// Safest thing to do is bail out and wait for the next poll.
+	return errors.Wrapf(sendError, "error while sending transaction %v", etx.ID)
 }
 
 // Finds next transaction in the queue, assigns a nonce, and moves it to "in_progress" state ready for broadcast.
@@ -336,14 +367,14 @@ func (eb *ethBroadcaster) handleInProgressEthTx(etx models.EthTx, attempt models
 func (eb *ethBroadcaster) nextUnstartedTransactionWithNonce(fromAddress gethCommon.Address) (*models.EthTx, error) {
 	etx := &models.EthTx{}
 	if err := findNextUnstartedTransactionFromAddress(eb.store.DB, etx, fromAddress); err != nil {
-		if gorm.IsRecordNotFoundError(err) {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// Finish. No more transactions left to process. Hoorah!
 			return nil, nil
 		}
 		return nil, errors.Wrap(err, "findNextUnstartedTransactionFromAddress failed")
 	}
 
-	nonce, err := eb.getNextNonceWithInitialLoad(etx.FromAddress)
+	nonce, err := GetNextNonce(eb.store.DB, etx.FromAddress)
 	if err != nil {
 		return nil, err
 	}
@@ -360,10 +391,10 @@ func (eb *ethBroadcaster) saveInProgressTransaction(etx *models.EthTx, attempt *
 	}
 	etx.State = models.EthTxInProgress
 	return eb.store.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(attempt).Error; err != nil {
+		if err := tx.Omit(clause.Associations).Create(attempt).Error; err != nil {
 			return errors.Wrap(err, "saveInProgressTransaction failed to create eth_tx_attempt")
 		}
-		return errors.Wrap(tx.Save(etx).Error, "saveInProgressTransaction failed to save eth_tx")
+		return errors.Wrap(tx.Omit(clause.Associations).Save(etx).Error, "saveInProgressTransaction failed to save eth_tx")
 	})
 }
 
@@ -376,24 +407,26 @@ func findNextUnstartedTransactionFromAddress(db *gorm.DB, etx *models.EthTx, fro
 		Error
 }
 
-func saveUnconfirmed(store *store.Store, etx *models.EthTx, attempt models.EthTxAttempt, callbacks ...func(tx *gorm.DB) error) error {
+func saveAttempt(store *store.Store, etx *models.EthTx, attempt models.EthTxAttempt, newAttemptState models.EthTxAttemptState, callbacks ...func(tx *gorm.DB) error) error {
 	if etx.State != models.EthTxInProgress {
 		return errors.Errorf("can only transition to unconfirmed from in_progress, transaction is currently %s", etx.State)
 	}
 	if attempt.State != models.EthTxAttemptInProgress {
 		return errors.New("attempt must be in in_progress state")
 	}
-	logger.Debugw("EthBroadcaster: successfully broadcast transaction", "ethTxID", etx.ID, "txHash", attempt.Hash.Hex())
+	if !(newAttemptState == models.EthTxAttemptBroadcast || newAttemptState == models.EthTxAttemptInsufficientEth) {
+		return errors.Errorf("new attempt state must be broadcast or insufficient_eth, got: %s", newAttemptState)
+	}
 	etx.State = models.EthTxUnconfirmed
-	attempt.State = models.EthTxAttemptBroadcast
+	attempt.State = newAttemptState
 	return store.Transaction(func(tx *gorm.DB) error {
 		if err := IncrementNextNonce(tx, etx.FromAddress, *etx.Nonce); err != nil {
 			return errors.Wrap(err, "saveUnconfirmed failed")
 		}
-		if err := tx.Save(etx).Error; err != nil {
+		if err := tx.Omit(clause.Associations).Save(etx).Error; err != nil {
 			return errors.Wrap(err, "saveUnconfirmed failed to save eth_tx")
 		}
-		if err := tx.Save(&attempt).Error; err != nil {
+		if err := tx.Omit(clause.Associations).Save(&attempt).Error; err != nil {
 			return errors.Wrap(err, "saveUnconfirmed failed to save eth_tx_attempt")
 		}
 		for _, f := range callbacks {
@@ -435,72 +468,24 @@ func saveFatallyErroredTransaction(store *store.Store, etx *models.EthTx) error 
 	if etx.Error == nil {
 		return errors.New("expected error field to be set")
 	}
-	logger.Errorw("EthBroadcaster: fatal error sending transaction", "ethTxID", etx.ID, "error", *etx.Error)
 	etx.Nonce = nil
 	etx.State = models.EthTxFatalError
 	return store.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec(`DELETE FROM eth_tx_attempts WHERE eth_tx_id = ?`, etx.ID).Error; err != nil {
 			return errors.Wrapf(err, "saveFatallyErroredTransaction failed to delete eth_tx_attempt with eth_tx.ID %v", etx.ID)
 		}
-		return errors.Wrap(tx.Save(etx).Error, "saveFatallyErroredTransaction failed to save eth_tx")
+		return errors.Wrap(tx.Omit(clause.Associations).Save(etx).Error, "saveFatallyErroredTransaction failed to save eth_tx")
 	})
 }
 
 // GetNextNonce returns keys.next_nonce for the given address
-func GetNextNonce(db *gorm.DB, address gethCommon.Address) (*int64, error) {
-	var nonce *int64
+func GetNextNonce(db *gorm.DB, address gethCommon.Address) (int64, error) {
+	var nonce int64
 	row := db.Raw("SELECT next_nonce FROM keys WHERE address = ?", address).Row()
 	if err := row.Scan(&nonce); err != nil {
-		return nil, errors.Wrap(err, "GetNextNonce failed scanning row")
+		return 0, errors.Wrap(err, "GetNextNonce failed scanning row")
 	}
 	return nonce, nil
-}
-
-// getNextNonce returns keys.next_nonce for the given address
-// It loads it from the database, or if this is a brand new key, queries the eth node for the latest nonce
-func (eb *ethBroadcaster) getNextNonceWithInitialLoad(address gethCommon.Address) (int64, error) {
-	nonce, err := GetNextNonce(eb.store.DB, address)
-	if err != nil {
-		return 0, err
-	}
-	if nonce != nil {
-		return *nonce, nil
-	}
-
-	return eb.loadAndSaveNonce(address)
-}
-
-func (eb *ethBroadcaster) loadAndSaveNonce(address gethCommon.Address) (int64, error) {
-	logger.Debugw("EthBroadcaster: loading next nonce from eth node", "address", address.Hex())
-	nonce, err := eb.loadInitialNonceFromEthClient(address)
-	if err != nil {
-		return 0, errors.Wrap(err, "GetNextNonce failed to loadInitialNonceFromEthClient")
-	}
-	res := eb.store.DB.Exec(`UPDATE keys SET next_nonce = ? WHERE next_nonce IS NULL AND address = ?`, nonce, address)
-	if res.Error != nil {
-		return 0, errors.Wrap(err, "GetNextNonce failed to save new nonce loaded from eth client")
-	}
-	if res.RowsAffected == 0 {
-		return 0, errors.Errorf("GetNextNonce optimistic locking failed; someone else modified key %s", address.Hex())
-	}
-	if nonce == 0 {
-		logger.Infow(fmt.Sprintf("EthBroadcaster: first use of address %s, starting from nonce 0",
-			address.Hex()), "address", address.Hex(), "nextNonce", nonce)
-	} else {
-		logger.Warnw(fmt.Sprintf("EthBroadcaster: address %s has been used before. Starting from nonce %v."+
-			" Please note that using the chainlink keys with an external wallet is NOT SUPPORTED and can lead to missed or stuck transactions.",
-			address.Hex(), nonce),
-			"address", address.Hex(), "nextNonce", nonce)
-	}
-
-	return int64(nonce), nil
-}
-
-func (eb *ethBroadcaster) loadInitialNonceFromEthClient(account gethCommon.Address) (nextNonce uint64, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), maxEthNodeRequestTime)
-	defer cancel()
-	nextNonce, err = eb.ethClient.PendingNonceAt(ctx, account)
-	return nextNonce, errors.WithStack(err)
 }
 
 // IncrementNextNonce increments keys.next_nonce by 1

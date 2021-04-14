@@ -1,4 +1,4 @@
-import { ApiResponse } from '@chainlink/json-api-client'
+import { ApiResponse } from 'utils/json-api-client'
 import { JobRun, OcrJobRun } from 'core/store/models'
 import { parseDot, Stratify } from './parseDot'
 import {
@@ -9,11 +9,7 @@ import {
 import { getOcrJobStatus } from './utils'
 
 function getTaskStatus({
-  taskRun: {
-    taskSpec: { dotId },
-    finishedAt,
-    error,
-  },
+  taskRun: { dotId, finishedAt, error },
   stratify,
   taskRuns,
 }: {
@@ -30,7 +26,7 @@ function getTaskStatus({
 
   if (currentNode) {
     currentNode.parentIds.forEach((id) => {
-      const parentTaskRun = taskRuns.find((tr) => tr.taskSpec.dotId === id)
+      const parentTaskRun = taskRuns.find((tr) => tr.dotId === id)
 
       if (parentTaskRun?.error !== null && parentTaskRun?.error === taskError) {
         taskError = 'not_run'
@@ -63,15 +59,18 @@ export const transformPipelineJobRun = (jobSpecId: string) => (
   jobRun: ApiResponse<OcrJobRun>['data'],
 ): PipelineJobRun => {
   const stratify = parseDot(
-    `digraph {${jobRun.attributes.pipelineSpec.DotDagSource}}`,
+    `digraph {${jobRun.attributes.pipelineSpec.dotDagSource}}`,
   )
-
+  let taskRuns: PipelineTaskRun[] = []
+  if (jobRun.attributes.taskRuns != null) {
+    taskRuns = jobRun.attributes.taskRuns.map(addTaskStatus(stratify))
+  }
   return {
     ...jobRun.attributes,
     id: jobRun.id,
     jobId: jobSpecId,
     status: getOcrJobStatus(jobRun.attributes),
-    taskRuns: jobRun.attributes.taskRuns.map(addTaskStatus(stratify)),
+    taskRuns,
     type: 'Off-chain reporting job run',
   }
 }
